@@ -194,8 +194,20 @@ pub(crate) fn build(ds: &Dataset) -> Vec<Event> {
         }
     }
     for (feed, ticks) in &ds.prices {
+        // Files hold whole days: keep the ticks from the first start to the last end of the
+        // markets on this feed.
+        let lives = ds
+            .markets
+            .iter()
+            .filter(|m| m.info.feed_slug().as_deref() == Some(feed));
+        let (first, last) = lives.fold((i64::MAX, i64::MIN), |(a, b), m| {
+            (
+                a.min(m.info.start.timestamp_millis()),
+                b.max(m.info.end.timestamp_millis()),
+            )
+        });
         for t in ticks {
-            if in_range(t.receive_ms) {
+            if in_range(t.receive_ms) && (first..=last).contains(&t.receive_ms) {
                 let kind = EventKind::PriceTick {
                     feed: feed.clone(),
                     price: t.price,

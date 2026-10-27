@@ -82,6 +82,8 @@ impl Dataset {
 pub struct Loader {
     http: Http,
     cache_dir: PathBuf,
+    /// Fixed "now" for tests.
+    clock: Option<DateTime<Utc>>,
 }
 
 impl Loader {
@@ -94,7 +96,12 @@ impl Loader {
         Ok(Loader {
             http: Http::new()?,
             cache_dir: dir.into(),
+            clock: None,
         })
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        self.clock.unwrap_or_else(Utc::now)
     }
 
     pub fn cache_dir(&self) -> &std::path::Path {
@@ -229,7 +236,7 @@ impl Loader {
         let cache = self.cache(req, &ep);
         let catalog = self.catalog(req).await?;
         let mut warnings = catalog.warnings;
-        let now = Utc::now();
+        let now = self.now();
 
         let mut trades = if req.data.trades {
             self.load_trades(&ep, &cache, &catalog.markets, now).await?
@@ -536,5 +543,210 @@ fn short_list(items: &[String]) -> String {
             items[..SHOW].join(", "),
             items.len() - SHOW
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use arrow_array::{
+        ArrayRef, Float64Array, RecordBatch, TimestampMillisecondArray, UInt64Array,
+    };
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use parquet::arrow::ArrowWriter;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::event::EventKind;
+    use crate::request::{DataKinds, parse_time};
+
+    type Tick = (i64, i64, f64, f64, Option<u64>);
+
+    /// A price file exactly as book-recorder writes it (`archive::prices_to_parquet`): sorted by
+    /// `publish_time`, nullable `slot`, default writer settings.
+    fn price_file(rows: &[Tick]) -> Vec<u8> {
+        let utc = || DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("publish_time", utc(), false),
+            Field::new("receive_time", utc(), false),
+            Field::new("price", DataType::Float64, false),
+            Field::new("conf", DataType::Float64, false),
+            Field::new("slot", DataType::UInt64, true),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(
+                TimestampMillisecondArray::from_iter_values(rows.iter().map(|r| r.0))
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(
+                TimestampMillisecondArray::from_iter_values(rows.iter().map(|r| r.1))
+                    .with_timezone("UTC"),
+            ),
+            Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.2))),
+            Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.3))),
+            Arc::new(UInt64Array::from_iter(rows.iter().map(|r| r.4))),
+        ];
+        let batch = RecordBatch::try_new(schema.clone(), cols).unwrap();
+        let mut out = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut out, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        out
+    }
+
+    /// Minimal HTTP server: path → body, anything else 404. Logs requested paths.
+    async fn serve(routes: Vec<(&'static str, Vec<u8>)>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16384];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let target = req.split_whitespace().nth(1).unwrap_or("");
+                let path = target.split('?').next().unwrap_or("").to_string();
+                seen.lock().unwrap().push(path.clone());
+                let body = routes.iter().find(|r| r.0 == path).map(|r| r.1.clone());
+                let head = match &body {
+                    Some(b) => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        b.len()
+                    ),
+                    None => {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                };
+                let _ = s.write_all(head.as_bytes()).await;
+                if let Some(b) = body {
+                    let _ = s.write_all(&b).await;
+                }
+                let _ = s.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), log)
+    }
+
+    const ADDR: &str = "0x72037b5314f64f03e899160a22c6097da6403f4d42f3684a9ac544ab944a7ae2";
+
+    /// A 1h market across midnight UTC: prices come from two day files.
+    const MARKET: &str = r#"[{"type":"market","address":"0x72037b5314f64f03e899160a22c6097da6403f4d42f3684a9ac544ab944a7ae2","instrument":"BTC","market_type":"UpDown","period":"1h","start_date":"2026-10-28T23:30:00Z","end_date":"2026-10-29T00:30:00Z","resolved_at":"2026-10-29T00:31:00Z","outcomes":["up","down"],"state":"settled","winner":"up","volume_traded":0,"strike":8000000000000,"resolved_value":8010000000000,"oracle":{"provider":"pyth","feeds":[{"id":"0xe62d","name":"BTC/USD","url":null}]}}]"#;
+
+    fn request(base: &str) -> Request {
+        Request::builder()
+            .api_url(base)
+            .data_url(base)
+            .market(ADDR)
+            .data(DataKinds {
+                prices: true,
+                ..Default::default()
+            })
+            .build()
+            .unwrap()
+    }
+
+    fn ms(s: &str) -> i64 {
+        parse_time(s).unwrap().timestamp_millis()
+    }
+
+    #[tokio::test]
+    async fn prices_from_recorder_files() {
+        let day1 = price_file(&[
+            (
+                ms("2026-10-28T23:00:00Z"),
+                ms("2026-10-28T23:00:00Z") + 300,
+                79000.0,
+                50.0,
+                Some(1),
+            ),
+            (
+                ms("2026-10-28T23:45:00Z"),
+                ms("2026-10-28T23:45:00Z") + 200,
+                80050.5,
+                40.0,
+                Some(2),
+            ),
+            (
+                ms("2026-10-28T23:45:01Z"),
+                ms("2026-10-28T23:45:01Z") + 150,
+                80051.0,
+                41.0,
+                None,
+            ),
+        ]);
+        let day2 = price_file(&[
+            (
+                ms("2026-10-29T00:10:00Z"),
+                ms("2026-10-29T00:10:00Z") + 100,
+                80100.0,
+                30.0,
+                Some(9),
+            ),
+            (
+                ms("2026-10-29T01:00:00Z"),
+                ms("2026-10-29T01:00:00Z") + 100,
+                80200.0,
+                30.0,
+                Some(10),
+            ),
+        ]);
+        let (base, log) = serve(vec![
+            ("/markets", MARKET.as_bytes().to_vec()),
+            ("/prices/pyth/btc-usd/2026-10-28.parquet", day1),
+            ("/prices/pyth/btc-usd/2026-10-29.parquet", day2),
+        ])
+        .await;
+        let req = request(&base);
+        let cache = tempfile::tempdir().unwrap();
+        let mut loader = Loader::with_cache_dir(cache.path()).unwrap();
+        loader.clock = Some(parse_time("2026-10-30T12:00:00Z").unwrap());
+
+        let ds = loader.load(&req).await.unwrap();
+        assert!(ds.warnings.is_empty(), "{:?}", ds.warnings);
+        let ticks = &ds.prices["btc-usd"];
+        assert_eq!(ticks.len(), 5, "whole days are kept");
+        assert_eq!(ticks[2].slot, None);
+        assert_eq!(ticks[1].receive_ms - ticks[1].publish_ms, 200);
+
+        // The stream has only the ticks inside the market (no range in the request).
+        let prices: Vec<f64> = ds
+            .events()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::PriceTick { price, feed, .. } if feed == "btc-usd" => Some(*price),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prices, vec![80050.5, 80051.0, 80100.0]);
+
+        // Second load: both days from the cache.
+        let files = |log: &Mutex<Vec<String>>| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.starts_with("/prices"))
+                .count()
+        };
+        assert_eq!(files(&log), 2);
+        loader.load(&req).await.unwrap();
+        assert_eq!(files(&log), 2);
+    }
+
+    #[tokio::test]
+    async fn missing_and_unpublished_price_days_are_warnings() {
+        let (base, _) = serve(vec![("/markets", MARKET.as_bytes().to_vec())]).await;
+        let cache = tempfile::tempdir().unwrap();
+        let mut loader = Loader::with_cache_dir(cache.path()).unwrap();
+        // The 28th is over but has no file, the 29th is still running.
+        loader.clock = Some(parse_time("2026-10-29T06:00:00Z").unwrap());
+        let ds = loader.load(&request(&base)).await.unwrap();
+        assert!(ds.prices.is_empty());
+        let w = ds.warnings.join(" | ");
+        assert!(w.contains("no file for btc-usd 2026-10-28"), "{w}");
+        assert!(w.contains("not yet available: 2026-10-29"), "{w}");
     }
 }

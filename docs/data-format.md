@@ -83,7 +83,7 @@ Kinds and their fields:
 | `type` | Time | Fields |
 |---|---|---|
 | `market_open` | `start` | `strike` |
-| `price_tick` | `receive_time` of the update | `feed` (`btc-usd`), `price`, `conf`, `publish_ms` |
+| `price_tick` | `receive_time` of the update | `feed` (`btc-usd`), `price`, `conf`, `publish_ms`. Only between the first start and the last end of the selected markets on that feed (and inside the range); `Dataset::prices` keeps the whole days. |
 | `book_snapshot` | recorder time | `levels`, `synthetic` |
 | `book_delta` | recorder time | `changes` |
 | `trade` | block time | `trade` |

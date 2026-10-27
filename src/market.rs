@@ -91,6 +91,7 @@ impl MarketInfo {
 /// Lowercase path segment as the data host names folders: anything but `[a-z0-9]` becomes `-`.
 pub fn path_segment(s: &str) -> String {
     let out: String = s
+        .trim()
         .to_ascii_lowercase()
         .chars()
         .map(|c| {
