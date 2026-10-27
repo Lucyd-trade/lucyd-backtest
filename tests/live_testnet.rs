@@ -90,7 +90,7 @@ async fn loads_prices_of_a_published_day() {
         .range(from, from + Duration::hours(1))
         .data(DataKinds {
             prices: true,
-            ..Default::default()
+            ..DataKinds::NONE
         })
         .build()
         .unwrap();
@@ -129,4 +129,69 @@ async fn loads_prices_of_a_published_day() {
         (1000..=7200).contains(&in_hour),
         "ticks in one hour: {in_hour}"
     );
+}
+
+/// CLOB fills of a recent hour. Passes with a note while `fills/` is not on the data host yet
+/// (book-recorder not deployed, or nothing uploaded).
+#[tokio::test]
+#[ignore = "needs network access to testnet"]
+async fn loads_fills_of_a_recent_hour() {
+    let to = (Utc::now() - Duration::days(2))
+        .date_naive()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        .and_utc();
+    let req = Request::builder()
+        .instrument("BTC")
+        .period(Period::M5)
+        .range(to - Duration::hours(1), to)
+        .data(DataKinds {
+            fills: true,
+            ..DataKinds::NONE
+        })
+        .build()
+        .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let loader = Loader::with_cache_dir(cache.path()).unwrap();
+    let ds = loader.load(&req).await.unwrap();
+    assert_eq!(ds.markets.len(), 12);
+    assert!(ds.markets.iter().all(|m| m.info.has_fills.is_some()));
+    let with: Vec<_> = ds
+        .markets
+        .iter()
+        .filter(|m| m.info.has_fills == Some(true))
+        .collect();
+    if with.is_empty() {
+        eprintln!("no fills files on the data host yet: {:?}", ds.warnings);
+        return;
+    }
+    for m in &with {
+        let fills = m.fills.as_ref().unwrap();
+        assert!(!fills.is_empty(), "a file has at least one fill");
+        assert!(
+            fills
+                .windows(2)
+                .all(|w| (w[0].ts_ms, w[0].journal_id) <= (w[1].ts_ms, w[1].journal_id))
+        );
+        for f in fills {
+            assert!(f.price > 0.0 && f.price < 1.0, "{f:?}");
+            assert!(f.size > 0 && f.outcome_index.is_some(), "{f:?}");
+            assert_eq!(f.market, m.info.address);
+        }
+    }
+    let fill_events = ds
+        .events()
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::Fill { .. }))
+        .count();
+    assert!(fill_events > 0);
+
+    // fills_only keeps exactly the markets with a file
+    let only = Request {
+        fills_only: true,
+        ..req
+    };
+    let cat = loader.catalog(&only).await.unwrap();
+    assert_eq!(cat.markets.len(), with.len());
+    assert_eq!(cat.without_fills_excluded, 12 - with.len());
 }

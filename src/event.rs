@@ -4,11 +4,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::book::{BookUpdate, Level};
+use crate::fills::Fill;
 use crate::loader::Dataset;
 use crate::trades::Trade;
 
 /// One event. Events are sorted by `ts_ms`, then by kind (see [`EventKind::rank`]), then by
-/// market or feed, then by their own order (book sequence, block and log index, publish time).
+/// market or feed, then by their own order (book sequence, fill journal id, block and log index,
+/// publish time).
 /// `seq` is the position in the stream.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
@@ -39,7 +41,11 @@ pub enum EventKind {
     BookSnapshot { levels: Vec<Level>, synthetic: bool },
     /// Levels set to a new size; size 0 removes the level.
     BookDelta { changes: Vec<Level> },
-    /// A fill, at the time of the block that settled it.
+    /// A match of the order book, at the order book's time. Includes matches whose settlement
+    /// failed: they took volume off the book all the same.
+    Fill { fill: Fill },
+    /// An on-chain fill, at the time of the block that settled it. A separate source from
+    /// `Fill`: the same match can appear as both.
     Trade { trade: Trade },
     /// The market expires (at `end`) with its result.
     MarketClose {
@@ -59,8 +65,9 @@ impl EventKind {
                 synthetic: true, ..
             } => 2,
             EventKind::BookSnapshot { .. } | EventKind::BookDelta { .. } => 3,
-            EventKind::Trade { .. } => 4,
-            EventKind::MarketClose { .. } => 5,
+            EventKind::Fill { .. } => 4,
+            EventKind::Trade { .. } => 5,
+            EventKind::MarketClose { .. } => 6,
         }
     }
 
@@ -70,6 +77,7 @@ impl EventKind {
             EventKind::PriceTick { .. } => "price_tick",
             EventKind::BookSnapshot { .. } => "book_snapshot",
             EventKind::BookDelta { .. } => "book_delta",
+            EventKind::Fill { .. } => "fill",
             EventKind::Trade { .. } => "trade",
             EventKind::MarketClose { .. } => "market_close",
         }
@@ -179,6 +187,18 @@ pub(crate) fn build(ds: &Dataset) -> Vec<Event> {
                 push(u.ts_ms(), addr, u.sequence(), i as u64, Some(addr), kind);
             }
         }
+        for f in m.fills.iter().flatten() {
+            if in_range(f.ts_ms) {
+                push(
+                    f.ts_ms,
+                    addr,
+                    f.journal_id.max(0) as u64,
+                    0,
+                    Some(addr),
+                    EventKind::Fill { fill: f.clone() },
+                );
+            }
+        }
         for t in m.trades.iter().flatten() {
             let ms = t.block_time.timestamp_millis();
             if in_range(ms) {
@@ -234,10 +254,29 @@ mod tests {
 
     use super::*;
     use crate::book::tests::{history, market};
+    use crate::fills::read_fills;
+    use crate::fills::tests::{Row, fills_file, row as fill_row};
     use crate::loader::MarketData;
+    use crate::market::MarketInfo;
     use crate::prices::PriceTick;
     use crate::request::{Request, parse_time};
     use crate::trades::Side;
+
+    /// A taker against two makers at 3000 ms (journal ids out of order in the input), and a
+    /// failed fill at 2000 ms.
+    fn fills(info: &MarketInfo) -> Vec<Fill> {
+        let rows = [
+            fill_row(info, 3000, 9, "t:b"),
+            fill_row(info, 3000, 8, "t:a"),
+            Row {
+                settlement: "failed",
+                ..fill_row(info, 2000, 4, "x")
+            },
+        ];
+        read_fills(info, bytes::Bytes::from(fills_file(&rows)))
+            .unwrap()
+            .0
+    }
 
     fn dataset(from: &str, to: &str) -> Dataset {
         let info = market();
@@ -272,9 +311,10 @@ mod tests {
                 .build()
                 .unwrap(),
             markets: vec![MarketData {
-                info,
                 book: Some(history()),
+                fills: Some(fills(&info)),
                 trades: Some(vec![trade]),
+                info,
             }],
             prices,
             warnings: vec![],
@@ -296,8 +336,11 @@ mod tests {
                 (1000, "price_tick"),
                 (1000, "book_snapshot"),
                 (2000, "book_delta"),
+                (2000, "fill"),
                 (3000, "price_tick"),
                 (3000, "book_delta"),
+                (3000, "fill"),
+                (3000, "fill"),
                 (3000, "trade"),
                 (4000, "book_snapshot"),
                 (5000, "book_delta"),
@@ -316,8 +359,11 @@ mod tests {
             vec![
                 (2000, "book_snapshot"),
                 (2000, "book_delta"),
+                (2000, "fill"),
                 (3000, "price_tick"),
                 (3000, "book_delta"),
+                (3000, "fill"),
+                (3000, "fill"),
                 (3000, "trade")
             ]
         );
@@ -328,6 +374,32 @@ mod tests {
             }
             k => panic!("{k:?}"),
         }
+    }
+
+    #[test]
+    fn fills_in_journal_order_next_to_trades() {
+        let ev = build(&dataset("0", "1000000"));
+        let ids: Vec<(&str, &str)> = ev
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Fill { fill } => Some(("fill", fill.trade_id.as_str())),
+                EventKind::Trade { trade } => Some(("trade", trade.trade_id.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("fill", "x"),
+                ("fill", "t:a"),
+                ("fill", "t:b"),
+                ("trade", "t1")
+            ]
+        );
+        let j = serde_json::to_value(ev.iter().find(|e| e.kind.name() == "fill").unwrap()).unwrap();
+        assert_eq!(j["type"], "fill");
+        assert_eq!(j["fill"]["settlement"], "failed");
+        assert_eq!(j["fill"]["size"], 2_500_000);
     }
 
     #[test]

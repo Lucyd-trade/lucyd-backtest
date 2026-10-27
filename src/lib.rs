@@ -1,8 +1,8 @@
 //! Data loader for backtests on [Lucyd](https://testnet.lucyd.trade) prediction markets.
 //!
 //! Build a [`Request`], hand it to a [`Loader`] and get a [`Dataset`]: the market catalog, the
-//! order book history, trades and Pyth prices of every selected market, one time-ordered
-//! [`Event`] stream, and the full book at any moment.
+//! order book history, CLOB fills, on-chain trades and Pyth prices of every selected market, one
+//! time-ordered [`Event`] stream, and the full book at any moment.
 //!
 //! ```no_run
 //! use lucyd_backtest::{DataKinds, Loader, Period, Request, parse_time};
@@ -12,7 +12,7 @@
 //!     .instrument("BTC")
 //!     .periods([Period::M15, Period::H1])
 //!     .range(parse_time("2026-10-20")?, parse_time("2026-10-21")?)
-//!     .data(DataKinds::ALL)
+//!     .data(DataKinds::DEFAULT) // book, fills, prices
 //!     .build()?;
 //! let data = Loader::new()?.load(&req).await?;
 //! for e in data.events() {
@@ -26,6 +26,7 @@ mod cache;
 mod error;
 mod event;
 pub mod export;
+mod fills;
 mod http;
 mod loader;
 mod market;
@@ -43,6 +44,7 @@ pub use book::{
 pub use cache::default_cache_dir;
 pub use error::{Error, Result};
 pub use event::{Event, EventKind};
+pub use fills::{Execution, Fill, Settlement, sort_fills};
 pub use loader::{Catalog, Dataset, Loader, MarketData};
 pub use market::{MarketInfo, MarketState, PRICE_SCALE, outcome_id};
 pub use network::{Endpoints, Network};

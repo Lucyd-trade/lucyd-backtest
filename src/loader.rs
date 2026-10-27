@@ -1,5 +1,5 @@
-//! Loads what a [`Request`] selects: the market catalog from the API, then trades, order book
-//! files and price files, through the local cache.
+//! Loads what a [`Request`] selects: the market catalog from the API, then order book, fills
+//! and price files and on-chain trades, through the local cache.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -12,6 +12,7 @@ use crate::book::{BookHistory, OrderBook, read_rows};
 use crate::cache::{Cache, default_cache_dir};
 use crate::error::{Error, Result};
 use crate::event::{self, Event};
+use crate::fills::{Fill, read_fills};
 use crate::http::Http;
 use crate::market::{ApiMarket, MarketInfo};
 use crate::network::Endpoints;
@@ -29,11 +30,18 @@ const FILE_DOWNLOADS: usize = 8;
 const TRADES_SETTLED: Duration = Duration::minutes(10);
 /// A book file appears within ~26 h after a market ends; after this its absence is final.
 const BOOK_FINAL_AFTER: Duration = Duration::days(2);
+/// A fills file appears within ~27 h after a market ends (26 h without a row, then up to 1 h for
+/// pending settlements), but the recorder's first run brings the last week of the order journal
+/// at once: until 10 days after the end an absent file may still come.
+const FILLS_FINAL_AFTER: Duration = Duration::days(10);
 
 /// Markets selected by a request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Catalog {
     pub markets: Vec<MarketInfo>,
+    /// Markets left out by `fills_only` because they have no fills file.
+    #[serde(default)]
+    pub without_fills_excluded: usize,
     pub warnings: Vec<String>,
 }
 
@@ -43,6 +51,9 @@ pub struct MarketData {
     pub info: MarketInfo,
     /// None if the book was not requested or there is no file.
     pub book: Option<BookHistory>,
+    /// CLOB fills; None if not requested, empty if the market has no fills file
+    /// (`info.has_fills`). Order: time, then journal id.
+    pub fills: Option<Vec<Fill>>,
     /// None if trades were not requested. Chain order.
     pub trades: Option<Vec<Trade>>,
 }
@@ -117,9 +128,48 @@ impl Loader {
         Cache::new(&self.cache_dir, &profile)
     }
 
-    /// Markets the request selects, oldest first.
+    /// Markets the request selects, oldest first. With fills requested or `fills_only`, each
+    /// market's `has_fills` is filled in (the fills files are downloaded into the cache).
     pub async fn catalog(&self, req: &Request) -> Result<Catalog> {
         let ep = req.endpoints()?;
+        let cache = self.cache(req, &ep);
+        Ok(self.catalog_with_fills(req, &ep, &cache).await?.0)
+    }
+
+    /// The catalog and the fills files of its markets (empty unless fills are requested or
+    /// filtered on).
+    async fn catalog_with_fills(
+        &self,
+        req: &Request,
+        ep: &Endpoints,
+        cache: &Cache,
+    ) -> Result<(Catalog, HashMap<String, bytes::Bytes>)> {
+        let mut cat = self.select(req, ep).await?;
+        if !req.data.fills && !req.fills_only {
+            return Ok((cat, HashMap::new()));
+        }
+        let now = self.now();
+        let files = self
+            .fetch_fills(ep, cache, &cat.markets, now, &mut cat.warnings)
+            .await?;
+        for m in &mut cat.markets {
+            m.has_fills = Some(files.contains_key(&m.address));
+        }
+        if req.fills_only {
+            let before = cat.markets.len();
+            cat.markets.retain(|m| m.has_fills == Some(true));
+            cat.without_fills_excluded = before - cat.markets.len();
+            if cat.without_fills_excluded > 0 {
+                cat.warnings.push(format!(
+                    "fills_only: {} market(s) without a fills file left out",
+                    cat.without_fills_excluded
+                ));
+            }
+        }
+        Ok((cat, files))
+    }
+
+    async fn select(&self, req: &Request, ep: &Endpoints) -> Result<Catalog> {
         let mut warnings = Vec::new();
         let url = format!("{}/markets", ep.api_url);
         let mut markets = Vec::new();
@@ -209,7 +259,11 @@ impl Loader {
         }
         markets
             .sort_by(|a, b| (a.start, a.period, &a.address).cmp(&(b.start, b.period, &b.address)));
-        Ok(Catalog { markets, warnings })
+        Ok(Catalog {
+            markets,
+            without_fills_excluded: 0,
+            warnings,
+        })
     }
 
     /// An empty result for an instrument the API does not know is a typo, not "no data".
@@ -234,9 +288,26 @@ impl Loader {
     pub async fn load(&self, req: &Request) -> Result<Dataset> {
         let ep = req.endpoints()?;
         let cache = self.cache(req, &ep);
-        let catalog = self.catalog(req).await?;
+        let (catalog, mut fill_files) = self.catalog_with_fills(req, &ep, &cache).await?;
         let mut warnings = catalog.warnings;
         let now = self.now();
+
+        let mut fills = HashMap::new();
+        if req.data.fills {
+            for m in &catalog.markets {
+                let Some(file) = fill_files.remove(&m.address) else {
+                    continue;
+                };
+                let (f, unknown) = read_fills(m, file)?;
+                if unknown > 0 {
+                    warnings.push(format!(
+                        "fills {}: {unknown} fill(s) of unknown tokens (no outcome index)",
+                        m.address
+                    ));
+                }
+                fills.insert(m.address.clone(), f);
+            }
+        }
 
         let mut trades = if req.data.trades {
             self.load_trades(&ep, &cache, &catalog.markets, now).await?
@@ -260,6 +331,10 @@ impl Loader {
             .into_iter()
             .map(|info| MarketData {
                 book: books.remove(&info.address),
+                fills: req
+                    .data
+                    .fills
+                    .then(|| fills.remove(&info.address).unwrap_or_default()),
                 trades: req
                     .data
                     .trades
@@ -416,6 +491,70 @@ impl Loader {
             absent.sort();
             warnings.push(format!(
                 "book: no file for {} market(s) (never had an order, or not uploaded yet): {}",
+                absent.len(),
+                short_list(&absent)
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Fills files of the markets that have one. Markets not over yet are not asked for.
+    async fn fetch_fills(
+        &self,
+        ep: &Endpoints,
+        cache: &Cache,
+        markets: &[MarketInfo],
+        now: DateTime<Utc>,
+        warnings: &mut Vec<String>,
+    ) -> Result<HashMap<String, bytes::Bytes>> {
+        let (todo, not_over): (Vec<&MarketInfo>, Vec<&MarketInfo>) =
+            markets.iter().partition(|m| m.end <= now);
+        let results: Vec<Result<(&MarketInfo, Option<bytes::Bytes>)>> = stream::iter(todo)
+            .map(|m| async move {
+                let path = cache.fills_path(&m.fills_path());
+                if let Some(b) = cache.read(&path)? {
+                    return Ok((m, Some(b)));
+                }
+                if cache.is_missing(&path) {
+                    return Ok((m, None));
+                }
+                let url = format!("{}/fills/{}", ep.data_url, m.fills_path());
+                match self.http.data_file(&url).await? {
+                    Some(b) => {
+                        cache.write(&path, &b)?;
+                        Ok((m, Some(b)))
+                    }
+                    None => {
+                        if now - m.end > FILLS_FINAL_AFTER {
+                            cache.mark_missing(&path)?;
+                        }
+                        Ok((m, None))
+                    }
+                }
+            })
+            .buffer_unordered(FILE_DOWNLOADS)
+            .collect()
+            .await;
+        let mut out = HashMap::new();
+        let mut absent = Vec::new();
+        for r in results {
+            match r? {
+                (m, Some(b)) => {
+                    out.insert(m.address.clone(), b);
+                }
+                (m, None) => absent.push(m.address.clone()),
+            }
+        }
+        if !not_over.is_empty() {
+            warnings.push(format!(
+                "fills: {} market(s) not over yet; a fills file appears after the market ends",
+                not_over.len()
+            ));
+        }
+        if !absent.is_empty() {
+            absent.sort();
+            warnings.push(format!(
+                "fills: no file for {} market(s) (no match, before the fills history of about 2026-10-20, or not uploaded yet): {}",
                 absent.len(),
                 short_list(&absent)
             ));
@@ -643,7 +782,7 @@ mod tests {
             .market(ADDR)
             .data(DataKinds {
                 prices: true,
-                ..Default::default()
+                ..DataKinds::NONE
             })
             .build()
             .unwrap()
@@ -748,5 +887,259 @@ mod tests {
         let w = ds.warnings.join(" | ");
         assert!(w.contains("no file for btc-usd 2026-10-28"), "{w}");
         assert!(w.contains("not yet available: 2026-10-29"), "{w}");
+    }
+
+    // ---- fills ----
+
+    const ADDR2: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// MARKET, and the same market under ADDR2.
+    fn two_markets() -> String {
+        format!(
+            "[{},{}]",
+            &MARKET[1..MARKET.len() - 1],
+            MARKET[1..MARKET.len() - 1].replace(ADDR, ADDR2)
+        )
+    }
+
+    fn info(addr: &str) -> MarketInfo {
+        let page: Vec<ApiMarket> = serde_json::from_str(&MARKET.replace(ADDR, addr)).unwrap();
+        convert(page).unwrap().remove(0)
+    }
+
+    fn fills_route(addr: &str) -> &'static str {
+        Box::leak(format!("/fills/updown/1h/btc/2026-10-28/{addr}.parquet").into_boxed_str())
+    }
+
+    /// A taker order against two makers (same ms), then a failed fill.
+    fn fills_fixture(addr: &str) -> Vec<u8> {
+        use crate::fills::tests::{Row, fills_file, row};
+        let m = info(addr);
+        let t = ms("2026-10-28T23:40:00Z");
+        fills_file(&[
+            row(&m, t, 101, "o1:m1"),
+            row(&m, t, 102, "o1:m2"),
+            Row {
+                settlement: "failed",
+                ..row(&m, t + 5_000, 103, "o2:m3")
+            },
+        ])
+    }
+
+    const TRADES: &str = r#"[{"trade_id":"o1:m1","tx_hash":"0xtx","log_index":3,"block_number":11900000,"block_time":"2026-10-28T23:40:12Z","market_id":"0x72037b5314f64f03e899160a22c6097da6403f4d42f3684a9ac544ab944a7ae2","match_type":"direct","trader":"0xaa","side":"buy","outcome_index":0,"price":0.55,"quantity":2500000,"amount_usd":1.375}]"#;
+
+    fn loader_at(dir: &std::path::Path) -> Loader {
+        let mut loader = Loader::with_cache_dir(dir).unwrap();
+        loader.clock = Some(parse_time("2026-10-30T12:00:00Z").unwrap());
+        loader
+    }
+
+    fn kinds(ds: &Dataset) -> Vec<(&'static str, String)> {
+        ds.events()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventKind::Fill { fill } => Some(("fill", fill.trade_id)),
+                EventKind::Trade { trade } => Some(("trade", trade.trade_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn default_kinds_load_fills_not_trades() {
+        let (base, log) = serve(vec![
+            ("/markets", MARKET.as_bytes().to_vec()),
+            ("/trades", TRADES.as_bytes().to_vec()),
+            (fills_route(ADDR), fills_fixture(ADDR)),
+        ])
+        .await;
+        let req = Request::builder()
+            .api_url(&base)
+            .data_url(&base)
+            .market(ADDR)
+            .build()
+            .unwrap();
+        assert_eq!(req.data, DataKinds::DEFAULT);
+        let cache = tempfile::tempdir().unwrap();
+        let loader = loader_at(cache.path());
+        let ds = loader.load(&req).await.unwrap();
+
+        assert!(
+            !log.lock().unwrap().iter().any(|p| p == "/trades"),
+            "trades not asked for"
+        );
+        let m = &ds.markets[0];
+        assert_eq!(m.info.has_fills, Some(true));
+        assert!(m.trades.is_none());
+        let fills = m.fills.as_ref().unwrap();
+        assert_eq!(fills.len(), 3);
+        assert_eq!(fills[2].settlement, crate::fills::Settlement::Failed);
+        assert_eq!(
+            kinds(&ds),
+            vec![
+                ("fill", "o1:m1".to_string()),
+                ("fill", "o1:m2".to_string()),
+                ("fill", "o2:m3".to_string())
+            ]
+        );
+        // multi-maker fills are adjacent in the stream
+        let ev = ds.events();
+        let pos: Vec<usize> = ev
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.kind, EventKind::Fill { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(pos[1], pos[0] + 1);
+
+        // second load reads the fills file from the cache
+        let fetched = |log: &Mutex<Vec<String>>| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.starts_with("/fills"))
+                .count()
+        };
+        assert_eq!(fetched(&log), 1);
+        loader.load(&req).await.unwrap();
+        assert_eq!(fetched(&log), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_fills_file_is_a_flag_not_an_error() {
+        let (base, log) = serve(vec![("/markets", MARKET.as_bytes().to_vec())]).await;
+        let req = Request::builder()
+            .api_url(&base)
+            .data_url(&base)
+            .market(ADDR)
+            .data(DataKinds {
+                fills: true,
+                ..DataKinds::NONE
+            })
+            .build()
+            .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut loader = loader_at(cache.path());
+        let ds = loader.load(&req).await.unwrap();
+        let m = &ds.markets[0];
+        assert_eq!(m.info.has_fills, Some(false));
+        assert_eq!(m.fills.as_deref(), Some(&[][..]));
+        let w = ds.warnings.join(" | ");
+        assert!(w.contains("fills: no file for 1 market(s)"), "{w}");
+
+        // Within ten days of the end the file may still come: asked for again. After that the
+        // absence is final.
+        let asked = |log: &Mutex<Vec<String>>| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.starts_with("/fills"))
+                .count()
+        };
+        assert_eq!(asked(&log), 1);
+        loader.clock = Some(parse_time("2026-11-09T00:00:00Z").unwrap());
+        loader.load(&req).await.unwrap();
+        assert_eq!(asked(&log), 2);
+        let ds = loader.load(&req).await.unwrap();
+        assert_eq!(asked(&log), 2);
+        assert_eq!(ds.markets[0].info.has_fills, Some(false));
+    }
+
+    #[tokio::test]
+    async fn fills_and_trades_are_two_streams() {
+        let (base, _) = serve(vec![
+            ("/markets", MARKET.as_bytes().to_vec()),
+            ("/trades", TRADES.as_bytes().to_vec()),
+            (fills_route(ADDR), fills_fixture(ADDR)),
+        ])
+        .await;
+        let req = Request::builder()
+            .api_url(&base)
+            .data_url(&base)
+            .market(ADDR)
+            .data("fills,trades".parse().unwrap())
+            .build()
+            .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let ds = loader_at(cache.path()).load(&req).await.unwrap();
+        // the same match o1:m1 comes once from each source, nothing merged
+        assert_eq!(
+            kinds(&ds),
+            vec![
+                ("fill", "o1:m1".to_string()),
+                ("fill", "o1:m2".to_string()),
+                ("fill", "o2:m3".to_string()),
+                ("trade", "o1:m1".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fills_only_leaves_out_markets_without_a_file() {
+        let (base, _) = serve(vec![
+            ("/markets", two_markets().into_bytes()),
+            (fills_route(ADDR2), fills_fixture(ADDR2)),
+        ])
+        .await;
+        let req = Request::builder()
+            .api_url(&base)
+            .data_url(&base)
+            .markets([ADDR, ADDR2])
+            .data(DataKinds::NONE)
+            .fills_only(true)
+            .build()
+            .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let loader = loader_at(cache.path());
+        let cat = loader.catalog(&req).await.unwrap();
+        assert_eq!(cat.without_fills_excluded, 1);
+        assert_eq!(cat.markets.len(), 1);
+        assert_eq!(cat.markets[0].address, ADDR2);
+        assert!(
+            cat.warnings
+                .iter()
+                .any(|w| w.contains("1 market(s) without a fills file"))
+        );
+
+        let ds = loader.load(&req).await.unwrap();
+        assert_eq!(ds.markets.len(), 1);
+        assert!(ds.markets[0].fills.is_none(), "filtered on, not requested");
+
+        // without the option both stay, each with its flag
+        let req = Request {
+            fills_only: false,
+            data: DataKinds::DEFAULT,
+            ..req
+        };
+        let cat = loader.catalog(&req).await.unwrap();
+        let flags: Vec<_> = cat
+            .markets
+            .iter()
+            .map(|m| (m.address.as_str(), m.has_fills))
+            .collect();
+        assert_eq!(cat.without_fills_excluded, 0);
+        assert!(flags.contains(&(ADDR, Some(false))) && flags.contains(&(ADDR2, Some(true))));
+    }
+
+    #[tokio::test]
+    async fn market_not_over_has_no_fills_without_asking() {
+        let (base, log) = serve(vec![("/markets", MARKET.as_bytes().to_vec())]).await;
+        let req = Request::builder()
+            .api_url(&base)
+            .data_url(&base)
+            .market(ADDR)
+            .data(DataKinds {
+                fills: true,
+                ..DataKinds::NONE
+            })
+            .build()
+            .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut loader = Loader::with_cache_dir(cache.path()).unwrap();
+        loader.clock = Some(parse_time("2026-10-29T00:00:00Z").unwrap());
+        let ds = loader.load(&req).await.unwrap();
+        assert_eq!(ds.markets[0].info.has_fills, Some(false));
+        assert!(ds.warnings.iter().any(|w| w.contains("not over yet")));
+        assert!(!log.lock().unwrap().iter().any(|p| p.starts_with("/fills")));
     }
 }

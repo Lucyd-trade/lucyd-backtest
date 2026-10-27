@@ -8,7 +8,7 @@ async fn main() -> lucyd_backtest::Result<()> {
         .instrument("BTC")
         .periods([Period::M15, Period::H1])
         .range(parse_time("2026-10-26")?, parse_time("2026-10-27")?)
-        .data(DataKinds::ALL)
+        .data(DataKinds::DEFAULT) // book, fills, prices; add trades for on-chain fills
         .build()?;
 
     let data = Loader::new()?.load(&req).await?;
@@ -18,8 +18,11 @@ async fn main() -> lucyd_backtest::Result<()> {
 
     for e in data.events() {
         match &e.kind {
-            EventKind::Trade { trade } => {
-                println!("{} trade {} @ {}", e.ts_ms, trade.quantity, trade.price)
+            EventKind::Fill { fill } => {
+                println!(
+                    "{} fill {} @ {} ({:?})",
+                    e.ts_ms, fill.quantity, fill.price, fill.settlement
+                )
             }
             EventKind::MarketClose { winner, .. } => {
                 println!("{} close, winner {winner:?}", e.ts_ms)

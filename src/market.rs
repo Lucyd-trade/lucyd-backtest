@@ -58,6 +58,10 @@ pub struct MarketInfo {
     pub outcome_ids: Vec<String>,
     /// Total traded notional, USD, at load time.
     pub volume_usd: f64,
+    /// Whether the data host has a fills file of the market. None = not checked (fills neither
+    /// requested nor filtered on). False: no match, not over yet, or older than the fills history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_fills: Option<bool>,
 }
 
 impl MarketInfo {
@@ -80,6 +84,12 @@ impl MarketInfo {
             self.start.format("%Y-%m-%d"),
             self.address
         )
+    }
+
+    /// Path of the fills file on the data host, without the `fills/` prefix: the same as the
+    /// book file's.
+    pub fn fills_path(&self) -> String {
+        self.book_path()
     }
 
     /// Price file folder name of the feed, e.g. `btc-usd`.
@@ -197,6 +207,7 @@ impl ApiMarket {
             outcomes,
             outcome_ids,
             volume_usd: self.volume_traded,
+            has_fills: None,
         }))
     }
 }

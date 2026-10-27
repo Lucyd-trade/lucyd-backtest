@@ -363,6 +363,7 @@ pub(crate) mod tests {
             voided: false,
             outcomes: vec!["up".into(), "down".into()],
             volume_usd: 0.0,
+            has_fills: None,
         }
     }
 

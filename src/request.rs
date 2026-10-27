@@ -144,12 +144,18 @@ impl fmt::Display for Period {
     }
 }
 
-/// Which data to load besides the market catalog.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Which data to load besides the market catalog. `fills` (order book matches) and `trades`
+/// (on-chain fills) are two separate sources; either, both or none can be loaded, and they are
+/// never merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataKinds {
     #[serde(default)]
     pub book: bool,
+    /// CLOB fills from the data host.
+    #[serde(default)]
+    pub fills: bool,
+    /// On-chain fills from `GET /trades`.
     #[serde(default)]
     pub trades: bool,
     #[serde(default)]
@@ -159,20 +165,35 @@ pub struct DataKinds {
 impl DataKinds {
     pub const ALL: DataKinds = DataKinds {
         book: true,
+        fills: true,
         trades: true,
         prices: true,
     };
     pub const NONE: DataKinds = DataKinds {
         book: false,
+        fills: false,
         trades: false,
         prices: false,
     };
+    /// `book,fills,prices`: on-chain trades only when asked for.
+    pub const DEFAULT: DataKinds = DataKinds {
+        book: true,
+        fills: true,
+        trades: false,
+        prices: true,
+    };
+}
+
+impl Default for DataKinds {
+    fn default() -> Self {
+        DataKinds::DEFAULT
+    }
 }
 
 impl FromStr for DataKinds {
     type Err = Error;
 
-    /// `book,trades,prices` in any combination, `all` or `none`.
+    /// `book,fills,trades,prices` in any combination, `all` or `none`.
     fn from_str(s: &str) -> Result<Self> {
         let mut out = DataKinds::NONE;
         for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -180,11 +201,12 @@ impl FromStr for DataKinds {
                 "all" => out = DataKinds::ALL,
                 "none" => {}
                 "book" | "books" | "orderbook" => out.book = true,
+                "fills" | "fill" => out.fills = true,
                 "trades" | "trade" => out.trades = true,
                 "prices" | "price" => out.prices = true,
                 _ => {
                     return Err(Error::InvalidRequest(format!(
-                        "unknown data kind {part:?}: book, trades, prices, all or none"
+                        "unknown data kind {part:?}: book, fills, trades, prices, all or none"
                     )));
                 }
             }
@@ -225,6 +247,10 @@ pub struct Request {
     pub to: Option<DateTime<Utc>>,
     #[serde(default)]
     pub data: DataKinds,
+    /// Leave out markets without a fills file (no match, not over yet, or older than the fills
+    /// history); the catalog counts them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fills_only: bool,
 }
 
 impl Request {
@@ -324,6 +350,7 @@ struct RequestDraft {
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
     data: DataKinds,
+    fills_only: bool,
 }
 
 impl RequestBuilder {
@@ -408,6 +435,12 @@ impl RequestBuilder {
         self
     }
 
+    /// Only markets that have a fills file.
+    pub fn fills_only(mut self, on: bool) -> Self {
+        self.req.fills_only = on;
+        self
+    }
+
     pub fn build(self) -> Result<Request> {
         let d = self.req;
         Request {
@@ -421,6 +454,7 @@ impl RequestBuilder {
             from: d.from,
             to: d.to,
             data: d.data,
+            fills_only: d.fills_only,
         }
         .validate()
     }
@@ -515,6 +549,7 @@ mod tests {
             .days("2026-10-01".parse().unwrap(), "2026-10-07".parse().unwrap())
             .data(DataKinds {
                 book: true,
+                fills: false,
                 trades: false,
                 prices: true,
             })
@@ -534,8 +569,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.periods, vec![Period::M15, Period::D1]);
-        assert!(r.data.trades && !r.data.book);
+        assert!(r.data.trades && !r.data.book && !r.data.fills);
         assert!(Request::from_json(r#"{"perods":["5m"],"markets":[]}"#).is_err());
+    }
+
+    #[test]
+    fn default_kinds_leave_out_trades() {
+        let d = DataKinds::default();
+        assert!(d.book && d.fills && d.prices && !d.trades);
+        let r = Request::builder().market(A).build().unwrap();
+        assert_eq!(r.data, DataKinds::DEFAULT);
+        let r = Request::from_json(&format!(r#"{{"markets":["{A}"]}}"#)).unwrap();
+        assert_eq!(r.data, DataKinds::DEFAULT, "no data field");
+        assert!(!r.fills_only);
+        let r = Request::builder()
+            .market(A)
+            .fills_only(true)
+            .build()
+            .unwrap();
+        assert!(r.to_json().contains("fills_only"));
+        assert_eq!(Request::from_json(&r.to_json()).unwrap(), r);
     }
 
     #[test]
@@ -567,10 +620,12 @@ mod tests {
             "book,prices".parse::<DataKinds>().unwrap(),
             DataKinds {
                 book: true,
+                fills: false,
                 trades: false,
                 prices: true
             }
         );
+        assert!("fills,trades".parse::<DataKinds>().unwrap().fills);
         assert!("bok".parse::<DataKinds>().is_err());
         assert_eq!(t("1761523200"), t("2025-10-27"));
     }

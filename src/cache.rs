@@ -46,6 +46,10 @@ impl Cache {
         self.root.join("books").join(book_path)
     }
 
+    pub(crate) fn fills_path(&self, fills_path: &str) -> PathBuf {
+        self.root.join("fills").join(fills_path)
+    }
+
     pub(crate) fn price_path(&self, feed: &str, day: &str) -> PathBuf {
         self.root
             .join("prices")

@@ -5,8 +5,8 @@ use clap::{Args, Parser, Subcommand};
 use lucyd_backtest::export::{Format, export};
 use lucyd_backtest::{DataKinds, Loader, MarketInfo, Request, default_cache_dir, parse_time};
 
-/// Lucyd backtest data: select markets, download their order book, trades and prices, export
-/// the event stream.
+/// Lucyd backtest data: select markets, download their order book, CLOB fills, on-chain trades
+/// and prices, export the event stream.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -74,9 +74,13 @@ struct RequestArgs {
     /// Range end, UTC, exclusive.
     #[arg(long)]
     to: Option<String>,
-    /// book, trades, prices in any combination, or all. Default for fetch and export: all.
+    /// book, fills, trades, prices in any combination, or all. Default: book,fills,prices
+    /// (on-chain trades only when asked for).
     #[arg(long)]
     data: Option<String>,
+    /// Only markets that have a CLOB fills file.
+    #[arg(long)]
+    fills_only: bool,
     /// Cache folder.
     #[arg(long, env = "LUCYD_BACKTEST_CACHE")]
     cache_dir: Option<PathBuf>,
@@ -130,6 +134,9 @@ impl RequestArgs {
         if let Some(d) = &self.data {
             r.data = d.parse()?;
         }
+        if self.fills_only {
+            r.fills_only = true;
+        }
         r.validate()
     }
 
@@ -144,8 +151,8 @@ fn price(v: Option<f64>) -> String {
 
 fn print_table(markets: &[MarketInfo]) {
     println!(
-        "{:<66}  {:<6} {:<5} {:<17} {:<17} {:<8} {:>12} {:>12}  winner",
-        "market", "instr", "per", "start (UTC)", "end (UTC)", "state", "strike", "final"
+        "{:<66}  {:<6} {:<5} {:<17} {:<17} {:<8} {:>12} {:>12}  {:<6} fills",
+        "market", "instr", "per", "start (UTC)", "end (UTC)", "state", "strike", "final", "winner"
     );
     for m in markets {
         let winner = if m.voided {
@@ -155,8 +162,13 @@ fn print_table(markets: &[MarketInfo]) {
                 .and_then(|w| m.outcomes.get(w as usize).cloned())
                 .unwrap_or_else(|| "-".into())
         };
+        let fills = match m.has_fills {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "-",
+        };
         println!(
-            "{:<66}  {:<6} {:<5} {:<17} {:<17} {:<8} {:>12} {:>12}  {}",
+            "{:<66}  {:<6} {:<5} {:<17} {:<17} {:<8} {:>12} {:>12}  {:<6} {}",
             m.address,
             m.instrument,
             m.period.as_str(),
@@ -165,7 +177,8 @@ fn print_table(markets: &[MarketInfo]) {
             format!("{:?}", m.state).to_lowercase(),
             price(m.strike),
             price(m.resolved_price),
-            winner
+            winner,
+            fills
         );
     }
 }
@@ -179,21 +192,42 @@ fn warn(warnings: &[String]) {
 async fn run(cli: Cli) -> lucyd_backtest::Result<()> {
     match cli.cmd {
         Cmd::List { req, json } => {
-            let r = req.build(DataKinds::NONE)?;
+            let r = req.build(DataKinds::DEFAULT)?;
             let cat = req.loader()?.catalog(&r).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&cat)?);
             } else {
                 print_table(&cat.markets);
-                println!("{} market(s)", cat.markets.len());
+                let mut total = format!("{} market(s)", cat.markets.len());
+                if r.data.fills || r.fills_only {
+                    let with = cat
+                        .markets
+                        .iter()
+                        .filter(|m| m.has_fills == Some(true))
+                        .count();
+                    total.push_str(&format!(", {with} with fills"));
+                }
+                if r.fills_only {
+                    total.push_str(&format!(
+                        ", {} without fills left out",
+                        cat.without_fills_excluded
+                    ));
+                }
+                println!("{total}");
                 warn(&cat.warnings);
             }
         }
         Cmd::Fetch { req } => {
-            let r = req.build(DataKinds::ALL)?;
+            let r = req.build(DataKinds::DEFAULT)?;
             let loader = req.loader()?;
             let ds = loader.load(&r).await?;
             let books = ds.markets.iter().filter(|m| m.book.is_some()).count();
+            let fills: usize = ds
+                .markets
+                .iter()
+                .filter_map(|m| m.fills.as_ref())
+                .map(Vec::len)
+                .sum();
             let trades: usize = ds
                 .markets
                 .iter()
@@ -202,7 +236,7 @@ async fn run(cli: Cli) -> lucyd_backtest::Result<()> {
                 .sum();
             let ticks: usize = ds.prices.values().map(Vec::len).sum();
             println!(
-                "{} market(s), {books} book file(s), {trades} trade(s), {ticks} price tick(s); cache {}",
+                "{} market(s), {books} book file(s), {fills} fill(s), {trades} trade(s), {ticks} price tick(s); cache {}",
                 ds.markets.len(),
                 loader.cache_dir().display()
             );
@@ -223,7 +257,7 @@ async fn run(cli: Cli) -> lucyd_backtest::Result<()> {
                     )
                 })?,
             };
-            let r = req.build(DataKinds::ALL)?;
+            let r = req.build(DataKinds::DEFAULT)?;
             let ds = req.loader()?.load(&r).await?;
             let events = ds.events();
             let rows = export(&events, &out, fmt)?;

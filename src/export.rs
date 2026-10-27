@@ -20,6 +20,13 @@ use crate::error::Result;
 use crate::event::{Event, EventKind};
 use crate::trades::Side;
 
+fn side_name(s: Side) -> &'static str {
+    match s {
+        Side::Buy => "buy",
+        Side::Sell => "sell",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Csv,
@@ -53,8 +60,12 @@ pub struct Row {
     pub conf: Option<f64>,
     pub publish_ms: Option<i64>,
     pub trade_id: Option<String>,
+    pub journal_id: Option<i64>,
     pub taker: Option<String>,
+    pub maker: Option<String>,
     pub match_type: Option<String>,
+    pub settlement: Option<&'static str>,
+    pub tx_hash: Option<String>,
     pub block_number: Option<u64>,
     pub strike: Option<f64>,
     pub winner: Option<i32>,
@@ -63,7 +74,7 @@ pub struct Row {
     pub synthetic: Option<bool>,
 }
 
-const COLUMNS: [&str; 21] = [
+const COLUMNS: [&str; 25] = [
     "seq",
     "ts",
     "type",
@@ -77,8 +88,12 @@ const COLUMNS: [&str; 21] = [
     "conf",
     "publish_ms",
     "trade_id",
+    "journal_id",
     "taker",
+    "maker",
     "match_type",
+    "settlement",
+    "tx_hash",
     "block_number",
     "strike",
     "winner",
@@ -154,18 +169,32 @@ pub fn rows(e: &Event) -> Vec<Row> {
             }
         }
         EventKind::BookDelta { changes } => changes.iter().map(level_row).collect(),
+        EventKind::Fill { fill } => vec![Row {
+            outcome: fill.outcome_index.map(i32::from),
+            side: Some(side_name(fill.side)),
+            price: Some(fill.price),
+            size: Some(fill.quantity),
+            amount_usd: Some(fill.amount_usd),
+            trade_id: Some(fill.trade_id.clone()),
+            journal_id: Some(fill.journal_id),
+            taker: Some(fill.taker.clone()),
+            maker: fill.maker.clone(),
+            match_type: fill.match_type.clone(),
+            settlement: Some(fill.settlement.as_str()),
+            tx_hash: fill.tx_hash.clone(),
+            block_number: fill.block_number,
+            ..base
+        }],
         EventKind::Trade { trade } => vec![Row {
             outcome: trade.outcome_index.map(i32::from),
-            side: Some(match trade.side {
-                Side::Buy => "buy",
-                Side::Sell => "sell",
-            }),
+            side: Some(side_name(trade.side)),
             price: Some(trade.price),
             size: Some(trade.quantity),
             amount_usd: Some(trade.amount_usd),
             trade_id: Some(trade.trade_id.clone()),
             taker: Some(trade.taker.clone()),
             match_type: Some(trade.match_type.clone()),
+            tx_hash: Some(trade.tx_hash.clone()),
             block_number: Some(trade.block_number),
             ..base
         }],
@@ -215,8 +244,12 @@ pub fn to_csv(rows: &[Row]) -> Result<Vec<u8>> {
             o(&r.conf),
             o(&r.publish_ms),
             o(&r.trade_id),
+            o(&r.journal_id),
             o(&r.taker),
+            o(&r.maker),
             o(&r.match_type),
+            o(&r.settlement),
+            o(&r.tx_hash),
             o(&r.block_number),
             o(&r.strike),
             o(&r.winner),
@@ -246,8 +279,12 @@ pub fn to_parquet(rows: &[Row]) -> Result<Vec<u8>> {
         Field::new("conf", DataType::Float64, true),
         Field::new("publish_ms", DataType::Int64, true),
         Field::new("trade_id", DataType::Utf8, true),
+        Field::new("journal_id", DataType::Int64, true),
         Field::new("taker", DataType::Utf8, true),
+        Field::new("maker", DataType::Utf8, true),
         Field::new("match_type", DataType::Utf8, true),
+        Field::new("settlement", DataType::Utf8, true),
+        Field::new("tx_hash", DataType::Utf8, true),
         Field::new("block_number", DataType::UInt64, true),
         Field::new("strike", DataType::Float64, true),
         Field::new("winner", DataType::Int32, true),
@@ -278,11 +315,13 @@ pub fn to_parquet(rows: &[Row]) -> Result<Vec<u8>> {
     let mut seq = UInt64Builder::new();
     let mut ts = TimestampMillisecondBuilder::new().with_timezone("UTC");
     let mut publish = Int64Builder::new();
+    let mut journal = Int64Builder::new();
     let mut block = UInt64Builder::new();
     for r in rows {
         seq.append_value(r.seq);
         ts.append_value(r.ts_ms);
         publish.append_option(r.publish_ms);
+        journal.append_option(r.journal_id);
         block.append_option(r.block_number);
     }
     let columns: Vec<ArrayRef> = vec![
@@ -299,8 +338,12 @@ pub fn to_parquet(rows: &[Row]) -> Result<Vec<u8>> {
         f64s(&|r| r.conf),
         Arc::new(publish.finish()),
         strs(&|r| r.trade_id.as_deref()),
+        Arc::new(journal.finish()),
         strs(&|r| r.taker.as_deref()),
+        strs(&|r| r.maker.as_deref()),
         strs(&|r| r.match_type.as_deref()),
+        strs(&|r| r.settlement),
+        strs(&|r| r.tx_hash.as_deref()),
         Arc::new(block.finish()),
         f64s(&|r| r.strike),
         i32s(&|r| r.winner),

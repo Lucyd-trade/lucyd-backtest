@@ -1,7 +1,8 @@
 //! Reading columns of the data host's Parquet files.
 
 use arrow_array::{
-    Array, Float64Array, RecordBatch, StringArray, TimestampMillisecondArray, UInt64Array,
+    Array, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+    UInt64Array,
 };
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -38,6 +39,13 @@ pub(crate) fn ts(b: &RecordBatch, name: &str, what: &str) -> Result<Vec<i64>> {
 
 pub(crate) fn u64s(b: &RecordBatch, name: &str, what: &str) -> Result<Vec<Option<u64>>> {
     let c = col::<UInt64Array>(b, name, what)?;
+    Ok((0..c.len())
+        .map(|i| c.is_valid(i).then(|| c.value(i)))
+        .collect())
+}
+
+pub(crate) fn i64s(b: &RecordBatch, name: &str, what: &str) -> Result<Vec<Option<i64>>> {
+    let c = col::<Int64Array>(b, name, what)?;
     Ok((0..c.len())
         .map(|i| c.is_valid(i).then(|| c.value(i)))
         .collect())
