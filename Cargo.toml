@@ -1,0 +1,36 @@
+[package]
+name = "lucyd-backtest"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Backtesting engine and data loader for Lucyd prediction markets (L2 order book, trades, Pyth prices)"
+license = "MIT"
+repository = "https://github.com/lucyd-trade/lucyd-backtest"
+keywords = ["backtesting", "prediction-markets", "orderbook", "market-data", "pyth"]
+categories = ["finance", "command-line-utilities"]
+
+[[bin]]
+name = "lucyd-backtest"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+arrow-array = "60"
+arrow-schema = "60"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+futures-util = "0.3"
+hex = "0.4"
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tiny-keccak = { version = "2", features = ["keccak"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }

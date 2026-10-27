@@ -1,0 +1,48 @@
+use thiserror::Error;
+
+/// Everything that can go wrong while building a request or loading data.
+#[derive(Debug, Error)]
+pub enum Error {
+    /// The request is incomplete or contradictory.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+    /// The selected network has no public data yet.
+    #[error(
+        "{0} is not launched yet: no public data. Use testnet, or pass your own api_url and data_url"
+    )]
+    NetworkNotLaunched(&'static str),
+    /// The API or the data host answered with an error that retries did not fix.
+    #[error("HTTP {status} from {url}: {body}")]
+    Http {
+        status: u16,
+        url: String,
+        body: String,
+    },
+    /// Network failure after all retries.
+    #[error("request to {url} failed: {source}")]
+    Transport {
+        url: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    /// A response or a file did not have the expected shape.
+    #[error("bad data in {what}: {detail}")]
+    BadData { what: String, detail: String },
+    #[error("cache: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("parquet: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
+    #[error("arrow: {0}")]
+    Arrow(#[from] arrow_schema::ArrowError),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub(crate) fn bad(what: impl Into<String>, detail: impl Into<String>) -> Error {
+    Error::BadData {
+        what: what.into(),
+        detail: detail.into(),
+    }
+}
