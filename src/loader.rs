@@ -38,16 +38,19 @@ const FILLS_FINAL_AFTER: Duration = Duration::days(10);
 /// Markets selected by a request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Catalog {
+    /// Selected markets.
     pub markets: Vec<MarketInfo>,
     /// Markets left out by `fills_only` because they have no fills file.
     #[serde(default)]
     pub without_fills_excluded: usize,
+    /// Things that were skipped or look odd; never fatal.
     pub warnings: Vec<String>,
 }
 
 /// Loaded data of one market.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketData {
+    /// Catalog entry.
     pub info: MarketInfo,
     /// None if the book was not requested or there is no file.
     pub book: Option<BookHistory>,
@@ -61,7 +64,9 @@ pub struct MarketData {
 /// Everything a request loaded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dataset {
+    /// The request this data answers.
     pub request: Request,
+    /// Every selected market with its data.
     pub markets: Vec<MarketData>,
     /// Ticks per feed (`btc-usd`), whole UTC days, sorted by receive time.
     pub prices: BTreeMap<String, Vec<PriceTick>>,
@@ -75,6 +80,7 @@ impl Dataset {
         event::build(self)
     }
 
+    /// A market by address.
     pub fn market(&self, address: &str) -> Option<&MarketData> {
         let a = address.to_ascii_lowercase();
         self.markets.iter().find(|m| m.info.address == a)
@@ -103,6 +109,7 @@ impl Loader {
         Self::with_cache_dir(default_cache_dir())
     }
 
+    /// A loader that caches in `dir`.
     pub fn with_cache_dir(dir: impl Into<PathBuf>) -> Result<Self> {
         Ok(Loader {
             http: Http::new()?,
@@ -115,6 +122,7 @@ impl Loader {
         self.clock.unwrap_or_else(Utc::now)
     }
 
+    /// Where downloads are kept.
     pub fn cache_dir(&self) -> &std::path::Path {
         &self.cache_dir
     }

@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use super::report::REPORT_VERSION;
 use super::*;
 use crate::book::tests::market;
 use crate::book::{BookHistory, BookSide, BookUpdate, Level};
@@ -734,4 +735,129 @@ fn journal_exports() {
     let pq = report::journal_bytes(&r.journal, Format::Parquet);
     let batches = crate::pq::read_batches(bytes::Bytes::from(pq), "test").unwrap();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+}
+
+#[test]
+fn exposure_follows_the_position_exactly() {
+    let ds = dataset(vec![snap(1000, up(&[(0.45, 50)], &[(0.5, 50)]))], vec![]);
+    let mut s = Script::default().at(2000, buy_up_fak(10, 0.5));
+    let r = run(&ds, &ExecParams::default(), &mut s).unwrap();
+    // a point where the position opens (order arrives at 2100) and where it is paid out
+    let open = r.equity.iter().find(|p| p.ts_ms == 2100).unwrap();
+    assert!(close(open.positions, 4.75), "10 up at the mid 0.475");
+    let paid = r
+        .journal
+        .iter()
+        .find(|j| j.event == "payout")
+        .unwrap()
+        .ts_ms;
+    let closed = r.equity.iter().find(|p| p.ts_ms == paid).unwrap();
+    assert_eq!(closed.positions, 0.0);
+    let m = &r.summary;
+    let span = (r.equity.last().unwrap().ts_ms - r.equity[0].ts_ms) as f64;
+    assert!(close(m.exposure_time.unwrap(), (paid - 2100) as f64 / span));
+    assert!(close(m.max_in_positions.unwrap(), 4.75));
+    assert!(m.avg_in_positions.unwrap() > 0.0);
+    // one winning market: no losses, so no profit factor
+    assert_eq!(m.profit_factor, None);
+    assert_eq!(m.best_market.as_ref().unwrap().market, addr());
+    // the market with an order carries its price path
+    assert!(!r.markets[0].marks.is_empty());
+    assert!(close(r.markets[0].marks[0].1, 0.475));
+    assert_eq!(r.version, REPORT_VERSION);
+}
+
+#[test]
+fn risk_metrics_per_sample() {
+    let r = busy_run(3);
+    let p = r.periods.as_ref().unwrap();
+    for m in [&r.summary, &p.fit, &p.validation] {
+        assert_eq!(m.risk_interval_ms, 3_600_000);
+        assert_eq!(m.annualization, 1.0);
+    }
+    // a run of 400 s has no full hour: Sharpe is undefined, not NaN
+    assert_eq!(r.summary.sharpe, None);
+    let json = r.to_json();
+    assert!(!json.contains("NaN") && !json.contains("Infinity"));
+    let short = ExecParams {
+        risk_interval_ms: 10_000,
+        equity_interval_ms: 1000,
+        ..ExecParams::default()
+    };
+    let ds = dataset(
+        (0..30)
+            .map(|i| {
+                let p = 0.40 + (i % 7) as f64 * 0.01;
+                snap(1000 + i * 10_000, up(&[(p, 50)], &[(p + 0.02, 50)]))
+            })
+            .collect(),
+        vec![],
+    );
+    let mut s = Script::default().at(2000, buy_up_fak(10, 0.5));
+    let r = run(&ds, &short, &mut s).unwrap();
+    assert!(r.summary.sharpe.is_some_and(f64::is_finite));
+    assert!(r.summary.max_drawdown_duration_ms.is_some());
+    let back = Report::from_json(&r.to_json()).unwrap();
+    assert_eq!(back, r);
+}
+
+#[test]
+fn html_report_is_self_contained() {
+    let mut r = busy_run(5);
+    r.strategy = "x</script><img src=x onerror=alert(1)>".into();
+    r.warnings
+        .push("warning with <b>tags</b> & </script>".into());
+    let h = r.to_html();
+    assert!(h.starts_with("<!doctype html>"));
+    assert!(h.trim_end().ends_with("</html>"));
+    for id in [
+        "id=\"header\"",
+        "id=\"warnings\"",
+        "id=\"metrics\"",
+        "id=\"equity\"",
+        "id=\"drawdown\"",
+        "id=\"market-pnl\"",
+        "id=\"market-detail\"",
+        "id=\"markets\"",
+        "id=\"orders\"",
+    ] {
+        assert!(h.contains(id), "missing {id}");
+    }
+    // the warnings come before the charts
+    assert!(h.find("id=\"warnings\"").unwrap() < h.find("id=\"equity\"").unwrap());
+    // nothing loaded from outside
+    for bad in [
+        "<link",
+        "src=\"http",
+        "href=\"http",
+        "url(",
+        "@import",
+        "<iframe",
+        "<img",
+    ] {
+        assert!(!h.contains(bad), "found {bad}");
+    }
+    // exactly two script elements, the data one parses back to the report's numbers
+    assert_eq!(h.matches("<script").count(), 2);
+    assert_eq!(h.matches("</script>").count(), 2);
+    let start = h
+        .find("<script type=\"application/json\" id=\"data\">")
+        .unwrap();
+    let body = &h[start..];
+    let body = &body[body.find('>').unwrap() + 1..body.find("</script>").unwrap()];
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(v["strategy"], serde_json::json!(r.strategy));
+    assert_eq!(v["equity"].as_array().unwrap().len(), r.equity.len());
+    assert_eq!(
+        v["fills"].as_array().unwrap().len(),
+        r.journal.iter().filter(|j| j.event == "fill").count()
+    );
+    assert!(v.get("journal").is_none());
+    // every metric card shows fit and validation
+    assert_eq!(
+        h.matches("class=\"card\"").count(),
+        h.matches("class=\"split\"").count()
+    );
+    // tags in text are escaped
+    assert!(h.contains("warning with &lt;b&gt;tags&lt;/b&gt; &amp; &lt;/script&gt;"));
 }

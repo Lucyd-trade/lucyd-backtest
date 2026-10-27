@@ -27,6 +27,7 @@ pub struct ExecParams {
     pub cancel_latency_ms: u64,
     /// Extra random delay added to every order and cancel, uniform in 0..=jitter, ms.
     pub latency_jitter_ms: u64,
+    /// How cancellations at our price move our place in the queue.
     pub queue_model: QueueModel,
     /// Trading fee on the notional of every own fill, basis points (0 now on Lucyd).
     pub fee_bps: u32,
@@ -43,6 +44,11 @@ pub struct ExecParams {
     pub equity_interval_ms: u64,
     /// Fewer own fills than this get a warning in the report.
     pub min_fills_warning: u32,
+    /// Step of the equity returns behind Sharpe and Sortino, ms (default one hour).
+    pub risk_interval_ms: u64,
+    /// Scale Sharpe and Sortino to a year: × √(intervals in 365 days). Off by default: the
+    /// report gives them per `risk_interval_ms`.
+    pub annualize: bool,
 }
 
 impl Default for ExecParams {
@@ -60,6 +66,8 @@ impl Default for ExecParams {
             validation_fraction: 0.3,
             equity_interval_ms: 60_000,
             min_fills_warning: 30,
+            risk_interval_ms: 3_600_000,
+            annualize: false,
         }
     }
 }
@@ -82,6 +90,9 @@ impl ExecParams {
         }
         if self.equity_interval_ms == 0 {
             return bad("equity_interval_ms must be above 0");
+        }
+        if self.risk_interval_ms == 0 {
+            return bad("risk_interval_ms must be above 0");
         }
         if self.fee_bps > 10_000 || self.redeem_fee_bps > 10_000 {
             return bad("fees are basis points, at most 10000");

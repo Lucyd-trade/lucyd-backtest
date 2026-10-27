@@ -17,6 +17,7 @@ pub enum Network {
 }
 
 impl Network {
+    /// `testnet` or `mainnet`.
     pub fn name(self) -> &'static str {
         match self {
             Network::Testnet => "testnet",

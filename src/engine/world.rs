@@ -174,10 +174,14 @@ pub(crate) struct Mkt {
     pub recorded_fills: u64,
     last_cticks: Option<u32>,
     pub acc: MarketAcc,
+    /// Mark of up over time, micro-USDC: (unix ms, mark), at most every `mark_step` ms.
+    pub marks: Vec<(i64, i64)>,
+    mark_step: i64,
 }
 
 impl Mkt {
     fn new(info: MarketInfo) -> Self {
+        let len = (info.end - info.start).num_milliseconds();
         Mkt {
             feed: info.feed_slug(),
             info,
@@ -191,6 +195,8 @@ impl Mkt {
             recorded_fills: 0,
             last_cticks: None,
             acc: MarketAcc::default(),
+            marks: Vec::new(),
+            mark_step: (len / 150).max(1000),
         }
     }
 
@@ -245,6 +251,16 @@ impl Mkt {
         }
     }
 
+    /// Notes the mark of up when it changed, at most every `mark_step` ms unless `force`.
+    pub fn record_mark(&mut self, now: i64, force: bool) {
+        let v = self.mark_up();
+        match self.marks.last() {
+            Some(&(_, last)) if last == v => {}
+            Some(&(t, _)) if !force && now - t < self.mark_step => {}
+            _ => self.marks.push((now, v)),
+        }
+    }
+
     /// Mark of up, micro-USDC per token: mid of the recorded book, one side of it, the last
     /// recorded fill, or 0.5.
     pub fn mark_up(&self) -> i64 {
@@ -285,14 +301,20 @@ impl Account {
 /// One line of the own-order journal.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct JournalRow {
+    /// Unix ms.
     pub ts_ms: i64,
     /// `submitted`, `accepted`, `rejected`, `fill`, `settlement_failed`, `cancel_requested`,
     /// `cancelled`, `cancel_failed`, `payout`.
     pub event: String,
+    /// Own order, for order events.
     pub order_id: Option<OrderId>,
+    /// Market address.
     pub market: String,
+    /// 0 = up, 1 = down.
     pub outcome: Option<u8>,
+    /// Buy or sell.
     pub side: Option<Side>,
+    /// GTC or FAK.
     pub tif: Option<TimeInForce>,
     /// Limit price for order events, execution price for fills, payout per token for payouts.
     pub price: Option<f64>,
@@ -300,8 +322,11 @@ pub struct JournalRow {
     pub quantity: Option<f64>,
     /// Tokens left on the order after the event.
     pub remaining: Option<f64>,
+    /// Maker or taker, for fills.
     pub liquidity: Option<Liquidity>,
+    /// How the CLOB settled a fill.
     pub match_type: Option<MatchType>,
+    /// Why: rejection, cancel or end reason.
     pub reason: Option<String>,
     /// USDC paid in fees by this event.
     pub fee: Option<f64>,
@@ -321,6 +346,8 @@ pub(crate) struct World {
     pub now: i64,
     /// Updates for the strategy, in the order they happened.
     pub updates: Vec<OrderUpdate>,
+    /// Bumped on every change of own token balances.
+    pub token_moves: u64,
 }
 
 impl World {
@@ -345,6 +372,7 @@ impl World {
             journal: Vec::new(),
             now: 0,
             updates: Vec::new(),
+            token_moves: 0,
         }
     }
 
@@ -557,6 +585,7 @@ impl World {
                 if !reverted {
                     self.acct.usdc -= value + fee;
                     *self.acct.tokens.entry(key).or_default() += raw as i64;
+                    self.token_moves += 1;
                 }
             }
             Side::Sell => {
@@ -565,6 +594,7 @@ impl World {
                 *self.acct.reserved_tokens.entry(key).or_default() -= release;
                 if !reverted {
                     *self.acct.tokens.entry(key).or_default() -= raw as i64;
+                    self.token_moves += 1;
                     self.acct.usdc += value - fee;
                 }
             }
@@ -908,6 +938,7 @@ impl World {
             };
             let pay = gross - fee;
             self.acct.tokens.insert((m, o), 0);
+            self.token_moves += 1;
             self.acct.usdc += pay;
             let acc = &mut self.markets[m].acc;
             acc.payout += pay;
@@ -946,8 +977,9 @@ impl World {
         v
     }
 
-    pub fn equity(&self) -> i64 {
-        self.acct.usdc + self.positions_value()
+    /// Whether any own tokens are held.
+    pub fn holds_tokens(&self) -> bool {
+        self.acct.tokens.values().any(|v| *v != 0)
     }
 }
 

@@ -24,6 +24,19 @@ lucyd-backtest = { git = "https://github.com/lucyd-trade/lucyd-backtest" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
+## Your own strategy in 5 minutes
+
+```bash
+cargo install --git https://github.com/lucyd-trade/lucyd-backtest
+lucyd-backtest new my-strategy
+cd my-strategy
+cargo run --release
+```
+
+`new` creates a Cargo project with one strategy in `src/main.rs`: a working example (near the end of each market, buy the side BTC is on if it is not too expensive) with comments on every handler, how to read the book and prices, how to place and cancel orders, and where the request and execution parameters are set. `cargo run` downloads the data (cached after the first time), runs the backtest, prints the summary and writes `reports/report.json` and `reports/report.html`. Open the HTML in a browser, change the strategy, run again.
+
+The engine comes in as a git dependency for now; once the crate is on crates.io, the one line in the project's `Cargo.toml` that says so switches it to `lucyd-backtest = "0.1"`. `--engine-path <dir>` points the project at a local checkout instead.
+
 ## Use from code
 
 ```rust
@@ -149,10 +162,23 @@ lucyd-backtest run --strategy late-side --config '{"seconds_before": 60, "usd": 
 | `validation_fraction` | `--validation-fraction` | 0.3 | last share of the range reported separately as out-of-sample; 0 = none |
 | `equity_interval_ms` | | 60000 | step of the equity curve |
 | `min_fills_warning` | | 30 | fewer own fills give a warning |
+| `risk_interval_ms` | `--risk-interval-ms` | 3600000 | step of the equity returns behind Sharpe and Sortino |
+| `annualize` | `--annualize` | false | scale Sharpe and Sortino to a 365-day year |
 
 ### Report
 
-`Report` (JSON via `to_json` / `write_json`): summary metrics (P&L, return, win rate by market, max drawdown, turnover, fees, average slippage of taker orders, limit order fill rate), the same for the fit and validation samples, per-market results, the equity curve, every own order with its status, the journal of own events, and warnings. `engine::write_journal` writes the journal to CSV or Parquet. Same data, parameters and seed give the same report bit for bit.
+`Report` (JSON via `to_json` / `write_json`, read back with `Report::read_json`): metrics for the whole run and separately for the fit and validation samples, per-market results with the price path of every market the strategy traded, the equity curve, every own order with its status, the journal of own events, and warnings. `engine::write_journal` writes the journal to CSV or Parquet; `report.summary_text()` is the terminal summary. Same data, parameters and seed give the same report bit for bit.
+
+Metrics: P&L and return; max drawdown, in USDC and %, and how long it lasted (from the high to the return to it, or to the end); Sharpe and Sortino of the equity returns per `risk_interval_ms` (one hour by default, not annualized unless `annualize`); win rate, profit factor (won / lost, by market), average win and loss and their ratio, best and worst market, the longest run of losing markets; exposure (share of time with an open position, average and largest capital in positions); turnover, fees, fills, average taker slippage, limit order fill rate. A metric the sample cannot define (no losing market, too few points) is `null`, never infinite. Exact definitions: [docs/execution.md](docs/execution.md#report). The report format has a `version` (now 2); version 1 reports still read.
+
+### HTML report
+
+`report.to_html()` / `write_html`, `run --html` (next to `--report`, same name with `.html`) or `lucyd-backtest html report.json` turn a report into one self-contained page: no external scripts, styles or fonts, so it opens offline and can be sent as a file. On it: the request and parameters, the warnings, metric cards with the fit / validation split, the equity curve with the start of the validation period, drawdown, P&L by market (sortable bars; tap one to open the market), the chosen market's up or down price with the strategy's own buys and sells on it, and tables of markets and orders with filters. Light and dark theme, readable on a phone.
+
+```bash
+lucyd-backtest run --strategy late-side --period 5m --from 2026-10-27 --to 2026-10-28 --report out/late.json --html
+lucyd-backtest html out/late.json -o late.html
+```
 
 ### How orders execute, in short
 
@@ -236,7 +262,7 @@ Downloads are kept in the system cache folder (`lucyd-backtest`). Finished marke
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo test -- --ignored   # also against the live testnet
+cargo test -- --ignored   # also against the live testnet, and builds a `new` project
 ```
 
 ## License

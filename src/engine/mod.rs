@@ -17,8 +17,10 @@
 //!
 //! The model is described in `docs/execution.md`.
 
+mod html;
 mod params;
 mod report;
+pub mod risk;
 mod strategy;
 mod world;
 
@@ -32,7 +34,10 @@ use crate::event::EventKind;
 use crate::loader::Dataset;
 
 pub use params::{ExecParams, QueueModel};
-pub use report::{EquityPoint, MarketReport, Metrics, OrderRecord, Periods, Report, write_journal};
+pub use report::{
+    EquityPoint, MarketReport, Metrics, OrderRecord, Periods, REPORT_VERSION, Report, write_journal,
+};
+pub use risk::MarketPnl;
 pub use strategy::{
     BookFeed, Ctx, Liquidity, MarketView, MatchType, OrderError, OrderId, OrderUpdate,
     OrderUpdateKind, OrderView, PriceView, Quote, Resolution, Strategy, Subscriptions, TimeInForce,
@@ -68,7 +73,9 @@ struct Engine {
     subs: Subscriptions,
     book_sent: Vec<Option<i64>>,
     book_due: Vec<bool>,
-    equity: Vec<(i64, i64)>,
+    equity: Vec<report::Sample>,
+    /// Whether own tokens were held at the last check, and `token_moves` then.
+    held: (bool, u64),
     start_ms: i64,
     end_ms: i64,
 }
@@ -105,6 +112,7 @@ pub fn run<S: Strategy + ?Sized>(
         book_sent: vec![None; n],
         book_due: vec![false; n],
         equity: Vec::new(),
+        held: (false, 0),
         start_ms,
         end_ms,
     };
@@ -149,22 +157,26 @@ pub fn run<S: Strategy + ?Sized>(
             }
             (EventKind::BookSnapshot { levels, .. }, Some(m)) => {
                 e.world.apply_book(m, levels, true);
+                e.world.markets[m].record_mark(ev.ts_ms, false);
                 e.flush(strategy);
                 e.book_changed(strategy, m);
             }
             (EventKind::BookDelta { changes }, Some(m)) => {
                 e.world.apply_book(m, changes, false);
+                e.world.markets[m].record_mark(ev.ts_ms, false);
                 e.flush(strategy);
                 e.book_changed(strategy, m);
             }
             (EventKind::Fill { fill }, Some(m)) => {
                 e.world.recorded_fill(m, fill);
+                e.world.markets[m].record_mark(ev.ts_ms, false);
                 e.flush(strategy);
                 if e.subs.fills {
                     e.call(strategy, |s, c| s.on_fill(c, fill));
                 }
             }
             (EventKind::MarketClose { .. }, Some(m)) => {
+                e.world.markets[m].record_mark(ev.ts_ms, true);
                 e.world.close(m);
                 e.flush(strategy);
                 let addr = e.world.markets[m].info.address.clone();
@@ -181,12 +193,14 @@ pub fn run<S: Strategy + ?Sized>(
             // On-chain trades are a separate, late source; execution uses fills.
             _ => {}
         }
+        e.check_held();
     }
     e.drain(strategy, i64::MAX, true);
     e.world.now = e.world.now.max(end_ms);
     e.call(strategy, |s, c| s.on_finish(c));
     e.flush(strategy);
-    let last = (e.world.now, e.world.equity());
+    e.check_held();
+    let last = e.sample();
     if e.equity.last().is_none_or(|p| p.0 < last.0) {
         e.equity.push(last);
     }
@@ -219,6 +233,30 @@ impl Engine {
             }
             self.world.now = self.world.now.max(ts);
             self.job(s, job);
+            self.check_held();
+        }
+    }
+
+    fn sample(&self) -> report::Sample {
+        let pos = self.world.positions_value();
+        (self.world.now, self.world.acct.usdc + pos, pos)
+    }
+
+    /// Adds an equity point when the first position opens or the last one closes, so exposure
+    /// is exact and not bound to the sampling step.
+    fn check_held(&mut self) {
+        if self.world.token_moves == self.held.1 {
+            return;
+        }
+        let h = self.world.holds_tokens();
+        self.held.1 = self.world.token_moves;
+        if h != self.held.0 {
+            self.held.0 = h;
+            let p = self.sample();
+            match self.equity.last_mut() {
+                Some(last) if last.0 == p.0 => *last = p,
+                _ => self.equity.push(p),
+            }
         }
     }
 
@@ -257,7 +295,11 @@ impl Engine {
                 self.call(s, |s, c| s.on_resolution(c, &addr, &r));
             }
             Job::Equity => {
-                self.equity.push((now, self.world.equity()));
+                let p = self.sample();
+                match self.equity.last_mut() {
+                    Some(last) if last.0 == p.0 => *last = p,
+                    _ => self.equity.push(p),
+                }
                 let step = self.world.params.equity_interval_ms as i64;
                 if now + step <= self.end_ms {
                     self.schedule(now + step, Job::Equity);

@@ -1,0 +1,162 @@
+//! {{name}}: a strategy for Lucyd "Bitcoin up or down" markets, backtested with lucyd-backtest.
+//!
+//! `cargo run --release` downloads the data (cached after the first run), runs the strategy,
+//! prints a summary and writes `reports/report.json` and `reports/report.html` (open it in a
+//! browser). Engine docs: https://github.com/lucyd-trade/lucyd-backtest
+//!
+//! Every market asks whether BTC ends its period above the strike (the price at the start).
+//! Outcome 0 is "up", outcome 1 is "down"; each pays 1 USDC if right, 0 if wrong, and prices are
+//! USDC per token on a 0.0025 grid between 0.0025 and 0.9975.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use lucyd_backtest::engine::{
+    BookFeed, Ctx, ExecParams, OrderUpdate, OrderUpdateKind, QueueModel, Strategy, Subscriptions,
+    run,
+};
+use lucyd_backtest::{Loader, Period, Request, Side, parse_time};
+
+/// Settings of the strategy. Change them here, or read them from a file or the command line.
+struct Config {
+    /// Buy when the market has this long left, seconds.
+    seconds_before: i64,
+    /// Only if BTC is at least this far from the strike, USD.
+    min_distance_usd: f64,
+    /// Tokens per market.
+    tokens: u64,
+    /// Highest price to pay for a token.
+    max_price: f64,
+}
+
+/// The strategy: near the end of each market, if BTC is clearly on one side of the strike, buy
+/// that side unless it is already too expensive. Replace the logic with your own.
+struct MyStrategy {
+    cfg: Config,
+    /// Markets already traded.
+    done: BTreeSet<String>,
+}
+
+impl Strategy for MyStrategy {
+    /// Name in the report.
+    fn name(&self) -> String {
+        "{{name}}".into()
+    }
+
+    /// What the engine sends to the handlers below. Fewer events = faster runs.
+    /// - `book`: `on_book` on every change (`EveryChange`), at most every N ms
+    ///   (`Throttle(N)`), or never (`Off`); the book can always be read from `ctx`.
+    /// - `fills`: `on_fill` for every recorded fill of other participants.
+    /// - `prices`: `on_price` for every Pyth tick.
+    /// - `timer_ms`: `on_timer` every N ms.
+    fn subscriptions(&self) -> Subscriptions {
+        Subscriptions {
+            book: BookFeed::Off,
+            fills: false,
+            prices: false,
+            timer_ms: Some(1000),
+        }
+    }
+
+    // Other handlers, all optional (empty by default):
+    //   on_start(ctx)                       once, before the first event
+    //   on_market_open(ctx, market)         a market starts trading
+    //   on_book(ctx, market)                its book changed (see `subscriptions`)
+    //   on_fill(ctx, fill)                  a recorded fill of someone else
+    //   on_price(ctx, feed, price)          a Pyth tick
+    //   on_market_close(ctx, market)        trading ended, result not known yet
+    //   on_resolution(ctx, market, result)  result on chain, positions paid out
+    //   on_finish(ctx)                      once, after the last event
+    //
+    // `ctx` shows the state as of now, nothing later:
+    //   ctx.now_ms(), ctx.open_markets(), ctx.market(addr)  -> period, start/end, strike,
+    //                                                          time_to_end_ms
+    //   ctx.book(addr), ctx.best_bid(addr, outcome), ctx.best_ask(addr, outcome)
+    //   ctx.market_price(addr)                               -> last BTC price from Pyth
+    //   ctx.usdc(), ctx.position(addr, outcome), ctx.open_orders(Some(addr))
+    // and places orders, which reach the book after the latency in `ExecParams`:
+    //   ctx.limit(addr, outcome, Side::Buy, price, tokens)          limit order (GTC)
+    //   ctx.market_order(addr, outcome, Side::Buy, tokens, Some(max_price))  market order (FAK)
+    //   ctx.cancel(order_id)
+
+    fn on_timer(&mut self, ctx: &mut Ctx) {
+        for m in ctx.open_markets() {
+            if self.done.contains(&m.address) || m.time_to_end_ms > self.cfg.seconds_before * 1000
+            {
+                continue;
+            }
+            let (Some(strike), Some(btc)) = (m.strike, ctx.market_price(&m.address)) else {
+                continue;
+            };
+            let distance = btc.price - strike;
+            if distance.abs() < self.cfg.min_distance_usd {
+                continue;
+            }
+            let outcome = if distance > 0.0 { 0 } else { 1 };
+            let Some(ask) = ctx.best_ask(&m.address, outcome) else {
+                continue;
+            };
+            if ask.price > self.cfg.max_price {
+                continue;
+            }
+            // An order needs at least 1 USDC of collateral, or it is rejected.
+            let tokens = self.cfg.tokens.max((1.0 / ask.price).ceil() as u64);
+            if ctx
+                .market_order(&m.address, outcome, Side::Buy, tokens, Some(self.cfg.max_price))
+                .is_ok()
+            {
+                self.done.insert(m.address);
+            }
+        }
+    }
+
+    /// Own orders: accepted, filled (partly or fully), cancelled, rejected with a reason.
+    fn on_order(&mut self, _ctx: &mut Ctx, update: &OrderUpdate) {
+        if let OrderUpdateKind::Rejected { reason } = &update.kind {
+            eprintln!("order {} rejected: {reason}", update.order_id);
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> lucyd_backtest::Result<()> {
+    // Which markets: series, time range (UTC) and data. Pyth prices exist from 2026-10-27.
+    let request = Request::builder()
+        .instrument("BTC")
+        .periods([Period::M5, Period::M15])
+        .range(parse_time("2026-10-27")?, parse_time("2026-10-28")?)
+        .build()?;
+
+    // How orders execute. Every field has a default; see ExecParams in the docs.
+    let params = ExecParams {
+        initial_usdc: 1000.0,
+        submit_latency_ms: 150,
+        queue_model: QueueModel::Pessimistic,
+        // the last 30% of the range is reported separately, as an out-of-sample check
+        validation_fraction: 0.3,
+        ..ExecParams::default()
+    };
+
+    let mut strategy = MyStrategy {
+        cfg: Config {
+            seconds_before: 30,
+            min_distance_usd: 20.0,
+            tokens: 20,
+            max_price: 0.9,
+        },
+        done: BTreeSet::new(),
+    };
+
+    let data = Loader::new()?.load(&request).await?;
+    let report = run(&data, &params, &mut strategy)?;
+
+    print!("{}", report.summary_text());
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
+    }
+    std::fs::create_dir_all("reports")?;
+    report.write_json(Path::new("reports/report.json"))?;
+    report.write_html(Path::new("reports/report.html"))?;
+    println!("report -> reports/report.json, reports/report.html");
+    Ok(())
+}

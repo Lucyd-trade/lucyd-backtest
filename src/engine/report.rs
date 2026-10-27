@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::book::tick_price;
 use crate::cache::write_atomic;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::export::Format;
 use crate::loader::Dataset;
 use crate::network::Network;
@@ -27,43 +27,66 @@ use crate::request::{Period, Request};
 use crate::trades::Side;
 
 use super::params::ExecParams;
+use super::risk::{self, MarketPnl};
 use super::strategy::{OrderId, TimeInForce};
 use super::world::{JournalRow, Order, OrderState, World, tokens, usd};
 
-/// Version of the report format.
-pub const REPORT_VERSION: u32 = 1;
+/// Version of the report format. 2 added the risk metrics, `positions` on equity points and
+/// `marks` on markets; a version 1 report still reads, with those empty.
+pub const REPORT_VERSION: u32 = 2;
 
+/// Everything a run produced. Its JSON form ([`Report::to_json`]) is stable within a
+/// [`REPORT_VERSION`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Report {
+    /// [`REPORT_VERSION`] of the writer.
     pub version: u32,
+    /// [`Strategy::name`](super::Strategy::name).
     pub strategy: String,
+    /// The data request the run used.
     pub request: Request,
+    /// Execution parameters of the run.
     pub params: ExecParams,
-    /// Time range of the run, unix ms.
+    /// Start of the time range, unix ms.
     pub from_ms: i64,
+    /// End of the time range, unix ms.
     pub to_ms: i64,
+    /// Metrics of the whole run.
     pub summary: Metrics,
     /// Fit and validation samples; None when `validation_fraction` is 0.
     pub periods: Option<Periods>,
+    /// Every market of the data, in the data's order.
     pub markets: Vec<MarketReport>,
+    /// Equity every `equity_interval_ms`, whenever the first position opens or the last one
+    /// closes, and at the end.
     pub equity: Vec<EquityPoint>,
+    /// Every own order.
     pub orders: Vec<OrderRecord>,
+    /// Every own event.
     pub journal: Vec<JournalRow>,
+    /// What to keep in mind when reading the numbers.
     pub warnings: Vec<String>,
 }
 
+/// The run split into an in-sample and an out-of-sample part.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Periods {
     /// Markets ending before this time (unix ms) are the fit sample, the rest the validation one.
     pub split_ms: i64,
+    /// Markets ending by `split_ms`, equity up to it.
     pub fit: Metrics,
+    /// Markets ending after `split_ms`, equity from it.
     pub validation: Metrics,
 }
 
-/// Money in USDC, prices in USDC per token.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Money in USDC, prices in USDC per token. A metric that needs more than the sample has (no
+/// losses, too few points) is None, never infinite or NaN.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Metrics {
+    /// Equity at the start of the sample.
     pub start_equity: f64,
+    /// Equity at the end of the sample.
     pub end_equity: f64,
     /// Sum of the markets' P&L.
     pub pnl: f64,
@@ -73,17 +96,23 @@ pub struct Metrics {
     pub markets_traded: u32,
     /// Of those, markets with P&L above 0.
     pub markets_won: u32,
+    /// `markets_won` / `markets_traded`.
     pub win_rate: Option<f64>,
     /// Largest fall of equity from a previous high.
     pub max_drawdown: f64,
+    /// The same fall, % of that high.
     pub max_drawdown_pct: f64,
     /// Notional of own fills.
     pub turnover: f64,
+    /// Trading and redemption fees paid.
     pub fees: f64,
+    /// Own fills, not counting reverted ones.
     pub fills: u32,
     /// Fills whose settlement failed (undone).
     pub reverted_fills: u32,
+    /// Own orders placed.
     pub orders: u32,
+    /// Of those, rejected on arrival.
     pub rejected_orders: u32,
     /// Orders that took liquidity on arrival.
     pub taker_orders: u32,
@@ -94,19 +123,61 @@ pub struct Metrics {
     pub limit_orders: u32,
     /// Of those, orders with any fill.
     pub limit_orders_filled: u32,
+    /// `limit_orders_filled` / `limit_orders`.
     pub limit_fill_rate: Option<f64>,
+
+    /// Step of the returns behind `sharpe` and `sortino`, ms (`ExecParams::risk_interval_ms`).
+    pub risk_interval_ms: u64,
+    /// Factor `sharpe` and `sortino` are multiplied by: 1 = per interval, √(intervals in 365
+    /// days) with `ExecParams::annualize`.
+    pub annualization: f64,
+    /// Mean over standard deviation of the equity returns per `risk_interval_ms`, ×
+    /// `annualization`.
+    pub sharpe: Option<f64>,
+    /// Mean over downside deviation of the same returns, × `annualization`.
+    pub sortino: Option<f64>,
+    /// Sum of winning markets' P&L over the loss of the losing ones.
+    pub profit_factor: Option<f64>,
+    /// Average P&L of a winning market.
+    pub avg_win: Option<f64>,
+    /// Average P&L of a losing market (below 0).
+    pub avg_loss: Option<f64>,
+    /// `avg_win` / −`avg_loss`.
+    pub win_loss_ratio: Option<f64>,
+    /// Traded market with the highest P&L.
+    pub best_market: Option<MarketPnl>,
+    /// Traded market with the lowest P&L.
+    pub worst_market: Option<MarketPnl>,
+    /// Most losing markets in a row, by end time.
+    pub max_losing_streak: u32,
+    /// From the high before the largest drawdown to the return to it (or to the end), ms.
+    pub max_drawdown_duration_ms: Option<i64>,
+    /// Whether equity got back to that high.
+    pub max_drawdown_recovered: Option<bool>,
+    /// Share of time with any open position, 0..1.
+    pub exposure_time: Option<f64>,
+    /// Time-weighted average value of open positions at their marks.
+    pub avg_in_positions: Option<f64>,
+    /// Largest value of open positions at their marks, as sampled on the equity curve.
+    pub max_in_positions: Option<f64>,
 }
 
+/// Result of one market.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MarketReport {
+    /// Market address.
     pub market: String,
+    /// Series.
     pub period: Period,
+    /// Trading start.
     pub start: DateTime<Utc>,
+    /// Trading end.
     pub end: DateTime<Utc>,
     /// `fit` or `validation` (`all` without a split).
     pub sample: String,
     /// `up`, `down`, `void`, or `unresolved` (no result within the data).
     pub result: String,
+    /// `cash` + `payout` + `open_value`.
     pub pnl: f64,
     /// Sells minus buys minus trading fees.
     pub cash: f64,
@@ -114,44 +185,71 @@ pub struct MarketReport {
     pub payout: f64,
     /// Tokens still held at the end of an unresolved market, at the last mark.
     pub open_value: f64,
+    /// Fees paid in this market.
     pub fees: f64,
+    /// Notional of own fills.
     pub turnover: f64,
+    /// Own fills.
     pub fills: u32,
+    /// Own fills undone by a failed settlement.
     pub reverted_fills: u32,
+    /// Own orders.
     pub orders: u32,
     /// Fills of other participants in the data: without them the queue model only moves on book
     /// changes.
     pub recorded_fills: u64,
+    /// Price of up over time as `[unix ms, price]`: the mark positions are valued at (book mid),
+    /// taken on changes at most every max(1 s, market length / 150). Only for markets with own
+    /// orders; down is 1 − up.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<(i64, f64)>,
 }
 
+/// One own order and how it ended.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderRecord {
+    /// Order id within the run.
     pub id: OrderId,
+    /// Market address.
     pub market: String,
+    /// 0 = up, 1 = down.
     pub outcome: u8,
+    /// Buy or sell.
     pub side: Side,
+    /// GTC (limit) or FAK (market).
     pub tif: TimeInForce,
+    /// Limit price (the worst price for a market order).
     pub price: f64,
     /// Tokens.
     pub quantity: f64,
+    /// Tokens filled.
     pub filled: f64,
     /// Average execution price, if anything filled.
     pub avg_price: Option<f64>,
     /// `filled`, `partially_filled`, `cancelled`, `rejected`, `open`.
     pub status: String,
+    /// Why it was rejected or ended.
     pub reason: Option<String>,
+    /// Placed by the strategy, unix ms.
     pub submitted_ms: i64,
+    /// Reached the book, unix ms.
     pub arrived_ms: Option<i64>,
+    /// Ended, unix ms.
     pub done_ms: Option<i64>,
     /// Taker part: average price minus the best price on arrival (buys; reversed for sells).
     pub slippage: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// One point of the equity curve.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct EquityPoint {
+    /// Unix ms.
     pub ts_ms: i64,
     /// USDC plus open positions at their marks.
     pub equity: f64,
+    /// Open positions at their marks (part of `equity`).
+    #[serde(default)]
+    pub positions: f64,
 }
 
 /// Fill-weighted average execution price of an order, from the journal.
@@ -213,6 +311,9 @@ fn record(o: &Order, w: &World, avg: Option<f64>) -> OrderRecord {
 }
 
 /// P&L parts of a market, micro-USDC: (pnl, open value).
+/// An equity sample, micro-USDC: (unix ms, equity, open positions at their marks).
+pub(crate) type Sample = (i64, i64, i64);
+
 fn market_pnl(w: &World, m: usize) -> (i64, i64) {
     let acc = &w.markets[m].acc;
     let up = w.markets[m].mark_up();
@@ -229,7 +330,7 @@ fn market_pnl(w: &World, m: usize) -> (i64, i64) {
 fn metrics(
     w: &World,
     markets: &[usize],
-    equity: &[(i64, i64)],
+    equity: &[Sample],
     start_equity: i64,
     initial: i64,
 ) -> Metrics {
@@ -269,7 +370,7 @@ fn metrics(
         }
     }
     let (mut peak, mut dd, mut dd_pct) = (i64::MIN, 0i64, 0.0f64);
-    for &(_, v) in equity {
+    for &(_, v, _) in equity {
         peak = peak.max(v);
         if peak - v > dd {
             dd = peak - v;
@@ -304,13 +405,46 @@ fn metrics(
         limit_orders: limits,
         limit_orders_filled: limits_filled,
         limit_fill_rate: (limits > 0).then(|| limits_filled as f64 / limits as f64),
+        ..Metrics::default()
     }
+}
+
+fn curve(equity: &[Sample]) -> Vec<EquityPoint> {
+    equity
+        .iter()
+        .map(|&(ts_ms, v, pos)| EquityPoint {
+            ts_ms,
+            equity: usd(v),
+            positions: usd(pos),
+        })
+        .collect()
+}
+
+/// Base metrics plus the risk metrics of the sample.
+fn sample_metrics(
+    w: &World,
+    set: &[usize],
+    equity: &[Sample],
+    reports: &[MarketReport],
+    start_equity: i64,
+    initial: i64,
+) -> Metrics {
+    let mut m = metrics(w, set, equity, start_equity, initial);
+    let rs: Vec<&MarketReport> = set.iter().map(|&i| &reports[i]).collect();
+    risk::apply(
+        &mut m,
+        &curve(equity),
+        &rs,
+        w.params.risk_interval_ms,
+        w.params.annualize,
+    );
+    m
 }
 
 pub(crate) fn build(
     data: &Dataset,
     w: &World,
-    equity: &[(i64, i64)],
+    equity: &[Sample],
     strategy: String,
     from_ms: i64,
     to_ms: i64,
@@ -321,20 +455,6 @@ pub(crate) fn build(
     let split_ms =
         (f > 0.0).then(|| from_ms + ((to_ms - from_ms) as f64 * (1.0 - f)).round() as i64);
     let fit_of = |m: usize| split_ms.is_none_or(|s| w.markets[m].info.end.timestamp_millis() <= s);
-
-    let summary = metrics(w, &all, equity, initial, initial);
-    let periods = split_ms.map(|s| {
-        let fit: Vec<usize> = all.iter().copied().filter(|&m| fit_of(m)).collect();
-        let val: Vec<usize> = all.iter().copied().filter(|&m| !fit_of(m)).collect();
-        let before: Vec<(i64, i64)> = equity.iter().copied().filter(|p| p.0 <= s).collect();
-        let after: Vec<(i64, i64)> = equity.iter().copied().filter(|p| p.0 >= s).collect();
-        let at_split = before.last().map_or(initial, |p| p.1);
-        Periods {
-            split_ms: s,
-            fit: metrics(w, &fit, &before, initial, initial),
-            validation: metrics(w, &val, &after, at_split, initial),
-        }
-    });
 
     let markets: Vec<MarketReport> = all
         .iter()
@@ -371,9 +491,28 @@ pub(crate) fn build(
                 reverted_fills: mk.acc.reverted,
                 orders: mk.acc.orders,
                 recorded_fills: mk.recorded_fills,
+                marks: if mk.acc.orders > 0 {
+                    mk.marks.iter().map(|&(t, v)| (t, usd(v))).collect()
+                } else {
+                    Vec::new()
+                },
             }
         })
         .collect();
+
+    let summary = sample_metrics(w, &all, equity, &markets, initial, initial);
+    let periods = split_ms.map(|s| {
+        let fit: Vec<usize> = all.iter().copied().filter(|&m| fit_of(m)).collect();
+        let val: Vec<usize> = all.iter().copied().filter(|&m| !fit_of(m)).collect();
+        let before: Vec<Sample> = equity.iter().copied().filter(|p| p.0 <= s).collect();
+        let after: Vec<Sample> = equity.iter().copied().filter(|p| p.0 >= s).collect();
+        let at_split = before.last().map_or(initial, |p| p.1);
+        Periods {
+            split_ms: s,
+            fit: sample_metrics(w, &fit, &before, &markets, initial, initial),
+            validation: sample_metrics(w, &val, &after, &markets, at_split, initial),
+        }
+    });
 
     let avg = avg_prices(&w.journal);
     let orders = w
@@ -452,13 +591,7 @@ pub(crate) fn build(
         summary,
         periods,
         markets,
-        equity: equity
-            .iter()
-            .map(|&(ts_ms, v)| EquityPoint {
-                ts_ms,
-                equity: usd(v),
-            })
-            .collect(),
+        equity: curve(equity),
         orders,
         journal: w.journal.clone(),
         warnings,
@@ -474,12 +607,148 @@ fn short(items: &[&str]) -> String {
 }
 
 impl Report {
+    /// The report as pretty JSON.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("report serializes")
     }
 
+    /// Writes [`Report::to_json`] to `path` (through a temporary file).
     pub fn write_json(&self, path: &Path) -> Result<()> {
         write_atomic(path, self.to_json().as_bytes())
+    }
+
+    /// Reads a report written by [`Report::to_json`]; version 1 reports read too.
+    pub fn from_json(text: &str) -> Result<Report> {
+        serde_json::from_str(text).map_err(|e| Error::InvalidRequest(format!("report: {e}")))
+    }
+
+    /// Reads a report from a JSON file.
+    pub fn read_json(path: &Path) -> Result<Report> {
+        Report::from_json(&std::fs::read_to_string(path)?)
+            .map_err(|e| Error::InvalidRequest(format!("{}: {e}", path.display())))
+    }
+
+    /// The report as one self-contained HTML page: charts and tables inline, works offline.
+    pub fn to_html(&self) -> String {
+        super::html::render(self)
+    }
+
+    /// Writes [`Report::to_html`] to `path`.
+    pub fn write_html(&self, path: &Path) -> Result<()> {
+        write_atomic(path, self.to_html().as_bytes())
+    }
+
+    /// A few lines for the terminal: the whole run, then fit and validation.
+    pub fn summary_text(&self) -> String {
+        let mut s = metrics_text(&format!("{}: whole range", self.strategy), &self.summary);
+        if let Some(p) = &self.periods {
+            let split = iso(p.split_ms);
+            s.push_str(&metrics_text(
+                &format!("fit (markets ending by {})", split[..16].replace('T', " ")),
+                &p.fit,
+            ));
+            s.push_str(&metrics_text("validation", &p.validation));
+        }
+        s
+    }
+}
+
+fn opt(v: Option<f64>, f: impl Fn(f64) -> String) -> String {
+    v.map(f).unwrap_or_else(|| "-".into())
+}
+
+/// Duration as `1d 2h`, `3h 5m`, `4m 10s` or `12s`.
+pub(crate) fn duration(ms: i64) -> String {
+    let s = ms / 1000;
+    let (d, h, m, sec) = (s / 86400, s % 86400 / 3600, s % 3600 / 60, s % 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {sec}s")
+    } else {
+        format!("{sec}s")
+    }
+}
+
+fn metrics_text(title: &str, m: &Metrics) -> String {
+    let pct = |v: f64| format!("{:.1}%", v * 100.0);
+    let num = |v: f64| format!("{v:.2}");
+    let mut s = String::new();
+    s.push_str(title);
+    s.push('\n');
+    s.push_str(&format!(
+        "  P&L {:+.2} USDC ({:+.2}%), equity {:.2} -> {:.2}, max drawdown {:.2} ({:.2}%, {}{})\n",
+        m.pnl,
+        m.return_pct,
+        m.start_equity,
+        m.end_equity,
+        m.max_drawdown,
+        m.max_drawdown_pct,
+        m.max_drawdown_duration_ms.map_or("-".into(), duration),
+        match m.max_drawdown_recovered {
+            Some(false) => ", not recovered",
+            _ => "",
+        }
+    ));
+    s.push_str(&format!(
+        "  sharpe {}, sortino {} (per {}{})\n",
+        opt(m.sharpe, num),
+        opt(m.sortino, num),
+        duration(m.risk_interval_ms as i64),
+        if m.annualization != 1.0 && m.annualization != 0.0 {
+            ", annualized"
+        } else {
+            ""
+        }
+    ));
+    s.push_str(&format!(
+        "  markets traded {}, won {}, win rate {}, profit factor {}, avg win {} / loss {} (x{}), longest losing streak {}\n",
+        m.markets_traded,
+        m.markets_won,
+        opt(m.win_rate, pct),
+        opt(m.profit_factor, num),
+        opt(m.avg_win, num),
+        opt(m.avg_loss, num),
+        opt(m.win_loss_ratio, num),
+        m.max_losing_streak
+    ));
+    if let (Some(b), Some(w)) = (&m.best_market, &m.worst_market) {
+        s.push_str(&format!(
+            "  best market {:+.2} ({}), worst {:+.2} ({})\n",
+            b.pnl,
+            short_addr(&b.market),
+            w.pnl,
+            short_addr(&w.market)
+        ));
+    }
+    s.push_str(&format!(
+        "  in a position {} of the time, capital in positions avg {} max {}\n",
+        opt(m.exposure_time, pct),
+        opt(m.avg_in_positions, num),
+        opt(m.max_in_positions, num)
+    ));
+    s.push_str(&format!(
+        "  orders {} (rejected {}), fills {} (reverted {}), turnover {:.2}, fees {:.2}\n",
+        m.orders, m.rejected_orders, m.fills, m.reverted_fills, m.turnover, m.fees
+    ));
+    s.push_str(&format!(
+        "  taker orders {}, avg slippage {}; limit orders {}, filled {} ({})\n",
+        m.taker_orders,
+        opt(m.avg_slippage, |v| format!("{v:.4}")),
+        m.limit_orders,
+        m.limit_orders_filled,
+        opt(m.limit_fill_rate, pct)
+    ));
+    s
+}
+
+fn short_addr(a: &str) -> String {
+    if a.len() > 14 {
+        format!("{}…{}", &a[..8], &a[a.len() - 4..])
+    } else {
+        a.to_string()
     }
 }
 

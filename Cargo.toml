@@ -3,9 +3,13 @@ name = "lucyd-backtest"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Backtesting engine and data loader for Lucyd prediction markets (L2 order book, trades, Pyth prices)"
+description = "Backtesting engine and data loader for Lucyd prediction markets: L2 order book, fills and Pyth prices, execution with latency and queue position, risk metrics and HTML reports"
 license = "MIT"
 repository = "https://github.com/lucyd-trade/lucyd-backtest"
+homepage = "https://lucyd.trade"
+documentation = "https://docs.rs/lucyd-backtest"
+readme = "README.md"
+exclude = [".github/"]
 keywords = ["backtesting", "prediction-markets", "orderbook", "market-data", "pyth"]
 categories = ["finance", "command-line-utilities"]
 
@@ -26,7 +30,7 @@ hex = "0.4"
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"
 tiny-keccak = { version = "2", features = ["keccak"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

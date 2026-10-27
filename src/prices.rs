@@ -26,6 +26,7 @@ pub struct PriceTick {
     pub price: f64,
     /// Confidence interval, USD.
     pub conf: f64,
+    /// Pythnet slot, when recorded.
     pub slot: Option<u64>,
 }
 

@@ -14,10 +14,15 @@ pub const PRICE_SCALE: f64 = 1e8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MarketState {
+    /// Not started.
     Upcoming,
+    /// Trading.
     Open,
+    /// Ended, no result yet.
     Pending,
+    /// Result on chain.
     Settled,
+    /// No oracle price in time: every token pays 0.5.
     Voided,
 }
 
@@ -33,20 +38,27 @@ impl MarketState {
 pub struct MarketInfo {
     /// Market id: `0x` + 64 hex, lowercase. Same as the CLOB market id.
     pub address: String,
+    /// Market type.
     pub market_type: MarketType,
+    /// Series.
     pub period: Period,
+    /// Underlying, e.g. `BTC`.
     pub instrument: String,
     /// Pyth feed id the market settles on, `0x…`.
     pub feed_id: Option<String>,
     /// Feed name as Pyth lists it, e.g. `BTC/USD`.
     pub feed_name: Option<String>,
+    /// Trading start.
     pub start: DateTime<Utc>,
+    /// Trading end.
     pub end: DateTime<Utc>,
+    /// State when the catalog was read.
     pub state: MarketState,
     /// Price at open, USD (API value / 1e8). None until the market opens.
     pub strike: Option<f64>,
     /// Oracle price at expiry, USD (API value / 1e8). None until settled.
     pub resolved_price: Option<f64>,
+    /// When the result reached the chain.
     pub resolved_at: Option<DateTime<Utc>>,
     /// Index of the winning outcome: 0 = up, 1 = down. None if not settled or voided.
     pub winner: Option<u8>,

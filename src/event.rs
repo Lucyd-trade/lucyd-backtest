@@ -14,6 +14,7 @@ use crate::trades::Trade;
 /// `seq` is the position in the stream.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
+    /// Position in the stream, from 0.
     pub seq: u64,
     /// Unix milliseconds, UTC.
     pub ts_ms: i64,
@@ -21,36 +22,62 @@ pub struct Event {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub market: Option<String>,
     #[serde(flatten)]
+    /// What happened.
     pub kind: EventKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// Kinds of events in the stream.
 pub enum EventKind {
     /// The market starts trading (at `start`); the strike is the price at that moment.
-    MarketOpen { strike: Option<f64> },
+    MarketOpen {
+        /// Strike, USD, once known.
+        strike: Option<f64>,
+    },
     /// A Pyth update, at the time the recorder received it.
     PriceTick {
+        /// Feed name, e.g. `btc-usd`.
         feed: String,
+        /// Price, USD.
         price: f64,
+        /// Confidence interval, USD.
         conf: f64,
+        /// Pyth publish time, unix ms.
         publish_ms: i64,
     },
     /// The complete book of both outcomes; replaces the previous book. `synthetic` = rebuilt
     /// from history at the range start, not recorded at this moment.
-    BookSnapshot { levels: Vec<Level>, synthetic: bool },
+    BookSnapshot {
+        /// Every level of both outcomes.
+        levels: Vec<Level>,
+        /// Rebuilt by the loader, not recorded at this moment.
+        synthetic: bool,
+    },
     /// Levels set to a new size; size 0 removes the level.
-    BookDelta { changes: Vec<Level> },
+    BookDelta {
+        /// Changed levels.
+        changes: Vec<Level>,
+    },
     /// A match of the order book, at the order book's time. Includes matches whose settlement
     /// failed: they took volume off the book all the same.
-    Fill { fill: Fill },
+    Fill {
+        /// The fill.
+        fill: Fill,
+    },
     /// An on-chain fill, at the time of the block that settled it. A separate source from
     /// `Fill`: the same match can appear as both.
-    Trade { trade: Trade },
+    Trade {
+        /// The trade.
+        trade: Trade,
+    },
     /// The market expires (at `end`) with its result.
     MarketClose {
+        /// Winning outcome, if known and not voided.
         winner: Option<u8>,
+        /// Final price of the underlying, USD.
         resolved_price: Option<f64>,
+        /// Whether the market was voided.
         voided: bool,
     },
 }
@@ -71,6 +98,7 @@ impl EventKind {
         }
     }
 
+    /// Short name: `market_open`, `price_tick`, `book_snapshot` and so on.
     pub fn name(&self) -> &'static str {
         match self {
             EventKind::MarketOpen { .. } => "market_open",

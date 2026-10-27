@@ -22,6 +22,8 @@
 //! # Ok(()) }
 //! ```
 
+#![warn(missing_docs)]
+
 mod book;
 mod cache;
 pub mod engine;

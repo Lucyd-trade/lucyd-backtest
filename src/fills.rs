@@ -15,6 +15,7 @@ use crate::trades::{Side, TOKEN_SCALE, Trade};
 pub enum Settlement {
     /// Not settled when the file was written (published after an hour with fills still pending).
     Pending,
+    /// Settled on chain.
     Confirmed,
     /// The settlement transaction failed. The match still happened in the order book and took
     /// the volume off it.
@@ -22,6 +23,7 @@ pub enum Settlement {
 }
 
 impl Settlement {
+    /// `pending`, `confirmed` or `failed`.
     pub fn as_str(self) -> &'static str {
         match self {
             Settlement::Pending => "pending",
@@ -37,6 +39,7 @@ impl Settlement {
 pub struct Fill {
     /// `takerOrderId:makerOrderId`, as in [`Trade::trade_id`].
     pub trade_id: String,
+    /// Market address.
     pub market: String,
     /// Match time by the order book clock, unix ms. Same clock as the book files.
     pub ts_ms: i64,
@@ -52,8 +55,11 @@ pub struct Fill {
     pub taker_asset_id: String,
     /// Maker wallet, lowercase; None if its order is unknown.
     pub maker: Option<String>,
+    /// Side of the maker, if recorded.
     pub maker_side: Option<Side>,
+    /// Outcome of the maker, if recorded.
     pub maker_outcome_index: Option<u8>,
+    /// Token id of the maker, if recorded.
     pub maker_asset_id: Option<String>,
     /// USDC per token of the taker's outcome, 0–1.
     pub price: f64,
@@ -65,26 +71,36 @@ pub struct Fill {
     pub amount_usd: f64,
     /// `direct`, `mint` or `merge`.
     pub match_type: Option<String>,
+    /// On-chain settlement of the match.
     pub settlement: Settlement,
     /// Settlement transaction.
     pub tx_hash: Option<String>,
+    /// Block of the settlement, if any.
     pub block_number: Option<u64>,
 }
 
 /// What [`Trade`] (on-chain) and [`Fill`] (order book) have in common: an engine written
 /// against this works with either.
 pub trait Execution {
+    /// Market address.
     fn market(&self) -> &str;
+    /// Fill or trade id.
     fn trade_id(&self) -> &str;
     /// Unix ms: match time for a fill, block time for a trade.
     fn ts_ms(&self) -> i64;
+    /// Taker address.
     fn taker(&self) -> &str;
+    /// Side of the taker.
     fn side(&self) -> Side;
+    /// Outcome of the taker.
     fn outcome_index(&self) -> Option<u8>;
+    /// Price per token, USDC.
     fn price(&self) -> f64;
     /// Outcome tokens.
     fn quantity(&self) -> f64;
+    /// USDC notional.
     fn amount_usd(&self) -> f64;
+    /// `direct`, `mint` or `merge`, if known.
     fn match_type(&self) -> Option<&str>;
 }
 

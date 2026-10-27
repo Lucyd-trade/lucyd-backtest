@@ -57,20 +57,27 @@ impl fmt::Display for MarketType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Period {
     #[serde(rename = "5m")]
+    /// 5 minutes.
     M5,
     #[serde(rename = "15m")]
+    /// 15 minutes.
     M15,
     #[serde(rename = "30m")]
+    /// 30 minutes.
     M30,
     #[serde(rename = "1h")]
+    /// 1 hour.
     H1,
     #[serde(rename = "4h")]
+    /// 4 hours.
     H4,
     #[serde(rename = "1d", alias = "daily", alias = "Daily")]
+    /// 1 day.
     D1,
 }
 
 impl Period {
+    /// Every series, shortest first.
     pub const ALL: [Period; 6] = [
         Period::M5,
         Period::M15,
@@ -80,6 +87,7 @@ impl Period {
         Period::D1,
     ];
 
+    /// Length of one market.
     pub fn duration(self) -> Duration {
         match self {
             Period::M5 => Duration::minutes(5),
@@ -151,6 +159,7 @@ impl fmt::Display for Period {
 #[serde(deny_unknown_fields)]
 pub struct DataKinds {
     #[serde(default)]
+    /// L2 order book history.
     pub book: bool,
     /// CLOB fills from the data host.
     #[serde(default)]
@@ -159,16 +168,19 @@ pub struct DataKinds {
     #[serde(default)]
     pub trades: bool,
     #[serde(default)]
+    /// Pyth price history.
     pub prices: bool,
 }
 
 impl DataKinds {
+    /// Everything, on-chain trades included.
     pub const ALL: DataKinds = DataKinds {
         book: true,
         fills: true,
         trades: true,
         prices: true,
     };
+    /// Nothing (catalog only).
     pub const NONE: DataKinds = DataKinds {
         book: false,
         fills: false,
@@ -221,6 +233,7 @@ impl FromStr for DataKinds {
 #[serde(deny_unknown_fields)]
 pub struct Request {
     #[serde(default)]
+    /// Which deployment.
     pub network: Network,
     /// Overrides the profile's API URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,6 +242,7 @@ pub struct Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_url: Option<String>,
     #[serde(default)]
+    /// Market type.
     pub market_type: MarketType,
     /// Underlying asset as `/markets` returns it, e.g. `BTC`. None = any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +260,7 @@ pub struct Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<DateTime<Utc>>,
     #[serde(default)]
+    /// Which data to load.
     pub data: DataKinds,
     /// Leave out markets without a fills file (no match, not over yet, or older than the fills
     /// history); the catalog counts them.
@@ -254,6 +269,7 @@ pub struct Request {
 }
 
 impl Request {
+    /// A builder with defaults.
     pub fn builder() -> RequestBuilder {
         RequestBuilder::default()
     }
@@ -275,6 +291,7 @@ impl Request {
         .endpoints()
     }
 
+    /// The request as pretty JSON.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("request serializes")
     }
@@ -354,6 +371,7 @@ struct RequestDraft {
 }
 
 impl RequestBuilder {
+    /// Network (default testnet).
     pub fn network(mut self, network: Network) -> Self {
         self.req.network.network = network;
         self
@@ -371,31 +389,37 @@ impl RequestBuilder {
         self
     }
 
+    /// Market type (default UpDown).
     pub fn market_type(mut self, t: MarketType) -> Self {
         self.req.market_type = t;
         self
     }
 
+    /// Underlying, e.g. `BTC`.
     pub fn instrument(mut self, instrument: impl Into<String>) -> Self {
         self.req.instrument = Some(instrument.into());
         self
     }
 
+    /// Adds a series.
     pub fn period(mut self, p: Period) -> Self {
         self.req.periods.push(p);
         self
     }
 
+    /// Adds several series.
     pub fn periods(mut self, ps: impl IntoIterator<Item = Period>) -> Self {
         self.req.periods.extend(ps);
         self
     }
 
+    /// Adds a market by address.
     pub fn market(mut self, address: impl Into<String>) -> Self {
         self.req.markets.push(address.into());
         self
     }
 
+    /// Adds markets by address.
     pub fn markets<S: Into<String>>(mut self, addresses: impl IntoIterator<Item = S>) -> Self {
         self.req
             .markets
@@ -410,11 +434,13 @@ impl RequestBuilder {
         self
     }
 
+    /// Range start, inclusive.
     pub fn from(mut self, from: DateTime<Utc>) -> Self {
         self.req.from = Some(from);
         self
     }
 
+    /// Range end, exclusive.
     pub fn to(mut self, to: DateTime<Utc>) -> Self {
         self.req.to = Some(to);
         self
@@ -430,6 +456,7 @@ impl RequestBuilder {
         self.range(start, end)
     }
 
+    /// Which data to load.
     pub fn data(mut self, data: DataKinds) -> Self {
         self.req.data = data;
         self
@@ -441,6 +468,7 @@ impl RequestBuilder {
         self
     }
 
+    /// Checks and returns the request.
     pub fn build(self) -> Result<Request> {
         let d = self.req;
         Request {

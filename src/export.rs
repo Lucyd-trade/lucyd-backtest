@@ -28,8 +28,11 @@ fn side_name(s: Side) -> &'static str {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Output file format.
 pub enum Format {
+    /// Comma-separated text.
     Csv,
+    /// Apache Parquet, zstd.
     Parquet,
 }
 
@@ -47,30 +50,55 @@ impl Format {
 /// One output row. Columns are listed in `docs/data-format.md`.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Row {
+    /// Position in the stream.
     pub seq: u64,
+    /// Unix ms.
     pub ts_ms: i64,
+    /// Event kind (`EventKind::name`).
     pub kind: &'static str,
+    /// Market address.
     pub market: Option<String>,
+    /// Price feed of a price tick.
     pub feed: Option<String>,
+    /// Outcome index.
     pub outcome: Option<i32>,
+    /// `buy` or `sell`, of the taker.
     pub side: Option<&'static str>,
+    /// Price: of the token, or USD for a price tick.
     pub price: Option<f64>,
+    /// Tokens.
     pub size: Option<f64>,
+    /// USDC notional.
     pub amount_usd: Option<f64>,
+    /// Pyth confidence interval.
     pub conf: Option<f64>,
+    /// Pyth publish time, unix ms.
     pub publish_ms: Option<i64>,
+    /// Fill or trade id.
     pub trade_id: Option<String>,
+    /// Order journal id of a fill.
     pub journal_id: Option<i64>,
+    /// Taker address.
     pub taker: Option<String>,
+    /// Maker address.
     pub maker: Option<String>,
+    /// `direct`, `mint` or `merge`.
     pub match_type: Option<String>,
+    /// Settlement of a fill.
     pub settlement: Option<&'static str>,
+    /// Transaction hash.
     pub tx_hash: Option<String>,
+    /// Block number.
     pub block_number: Option<u64>,
+    /// Strike of a market opening, USD.
     pub strike: Option<f64>,
+    /// Winning outcome at close.
     pub winner: Option<i32>,
+    /// Final price at close, USD.
     pub resolved_price: Option<f64>,
+    /// Whether the market was voided.
     pub voided: Option<bool>,
+    /// Whether a book snapshot was rebuilt by the loader.
     pub synthetic: Option<bool>,
 }
 
@@ -220,6 +248,7 @@ fn csv_field(s: &str) -> String {
     }
 }
 
+/// Rows as CSV bytes.
 pub fn to_csv(rows: &[Row]) -> Result<Vec<u8>> {
     fn o<T: ToString>(v: &Option<T>) -> String {
         v.as_ref().map(|v| v.to_string()).unwrap_or_default()
@@ -263,6 +292,7 @@ pub fn to_csv(rows: &[Row]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Rows as Parquet bytes.
 pub fn to_parquet(rows: &[Row]) -> Result<Vec<u8>> {
     let utc = || DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
     let schema = Arc::new(Schema::new(vec![

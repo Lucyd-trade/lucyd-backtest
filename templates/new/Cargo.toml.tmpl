@@ -1,0 +1,14 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The backtest engine. It comes from git until the crate is on crates.io; then replace the
+# line below with: lucyd-backtest = "0.1"
+lucyd-backtest = { git = "https://github.com/lucyd-trade/lucyd-backtest" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[profile.release]
+debug = false

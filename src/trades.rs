@@ -16,8 +16,11 @@ pub(crate) const MAX_OFFSET: u32 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+/// Side of an order or fill.
 pub enum Side {
+    /// Buy.
     Buy,
+    /// Sell.
     Sell,
 }
 
@@ -26,9 +29,13 @@ pub enum Side {
 pub struct Trade {
     /// `takerOrderId:makerOrderId`, unique per fill.
     pub trade_id: String,
+    /// Market address.
     pub market: String,
+    /// Transaction hash.
     pub tx_hash: String,
+    /// Block number.
     pub block_number: u64,
+    /// Log index in the block.
     pub log_index: u64,
     /// Time of the block that settled the fill (whole seconds; the match happened up to a few
     /// blocks earlier).
@@ -45,6 +52,7 @@ pub struct Trade {
     pub price: f64,
     /// Outcome tokens (raw units / 1e6).
     pub quantity: f64,
+    /// USDC notional.
     pub amount_usd: f64,
 }
 

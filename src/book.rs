@@ -15,8 +15,11 @@ pub const TICK: f64 = 0.0025;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+/// Side of a book level.
 pub enum BookSide {
+    /// Buy orders.
     Bid,
+    /// Sell orders.
     Ask,
 }
 
@@ -25,6 +28,7 @@ pub enum BookSide {
 pub struct Level {
     /// 0 = up, 1 = down.
     pub outcome: u8,
+    /// Bid or ask.
     pub side: BookSide,
     /// USDC per token, a multiple of 0.0025.
     pub price: f64,
@@ -38,6 +42,7 @@ impl Level {
         self.size as f64 / crate::trades::TOKEN_SCALE
     }
 
+    /// Price in ticks of 0.0025.
     pub fn ticks(&self) -> u32 {
         price_ticks(self.price)
     }
@@ -48,6 +53,7 @@ pub fn tick_price(ticks: u32) -> f64 {
     ticks as f64 * 25.0 / 10_000.0
 }
 
+/// Price in ticks of 0.0025, rounded to the nearest tick.
 pub fn price_ticks(price: f64) -> u32 {
     (price / TICK).round().max(0.0) as u32
 }
@@ -58,25 +64,33 @@ pub fn price_ticks(price: f64) -> u32 {
 pub enum BookUpdate {
     /// The complete book of both outcomes; replaces everything before it.
     Snapshot {
+        /// Unix ms.
         ts_ms: i64,
+        /// Order book sequence number.
         sequence: u64,
+        /// Every level of both outcomes.
         levels: Vec<Level>,
     },
     /// Levels set to a new size (0 = removed).
     Delta {
+        /// Unix ms.
         ts_ms: i64,
+        /// Order book sequence number.
         sequence: u64,
+        /// Changed levels; size 0 removes a level.
         changes: Vec<Level>,
     },
 }
 
 impl BookUpdate {
+    /// Unix ms of the update.
     pub fn ts_ms(&self) -> i64 {
         match self {
             BookUpdate::Snapshot { ts_ms, .. } | BookUpdate::Delta { ts_ms, .. } => *ts_ms,
         }
     }
 
+    /// Order book sequence number of the update.
     pub fn sequence(&self) -> u64 {
         match self {
             BookUpdate::Snapshot { sequence, .. } | BookUpdate::Delta { sequence, .. } => *sequence,
@@ -87,7 +101,9 @@ impl BookUpdate {
 /// Bids and asks of one outcome, keyed by price in ticks.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OutcomeBook {
+    /// Price in ticks to size in raw units (1e-6 token).
     pub bids: BTreeMap<u32, u64>,
+    /// Price in ticks to size in raw units (1e-6 token).
     pub asks: BTreeMap<u32, u64>,
 }
 
@@ -112,6 +128,7 @@ impl OutcomeBook {
         self.asks.iter().next().map(|(t, s)| (tick_price(*t), *s))
     }
 
+    /// Midpoint of the best bid and ask, if both exist.
     pub fn mid(&self) -> Option<f64> {
         Some((self.best_bid()?.0 + self.best_ask()?.0) / 2.0)
     }
@@ -137,10 +154,12 @@ pub struct OrderBook {
 }
 
 impl OrderBook {
+    /// Book of outcome `index` (0 = up, 1 = down).
     pub fn outcome(&self, index: u8) -> Option<&OutcomeBook> {
         self.outcomes.get(index as usize)
     }
 
+    /// Applies a snapshot (replaces everything) or a delta.
     pub fn apply(&mut self, u: &BookUpdate) {
         match u {
             BookUpdate::Snapshot { ts_ms, levels, .. } => {
@@ -194,7 +213,9 @@ impl OrderBook {
 /// Recorded book of one market, in time order.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BookHistory {
+    /// Market address.
     pub market: String,
+    /// Snapshots and deltas in order.
     pub updates: Vec<BookUpdate>,
 }
 
@@ -328,6 +349,7 @@ impl BookHistory {
         Some(book)
     }
 
+    /// Time of the first update, unix ms.
     pub fn first_ts_ms(&self) -> Option<i64> {
         self.updates.first().map(BookUpdate::ts_ms)
     }

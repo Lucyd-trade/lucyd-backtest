@@ -5,16 +5,17 @@ use std::process::ExitCode;
 mod ladder_mm;
 #[path = "../examples/strategies/late_side.rs"]
 mod late_side;
+mod scaffold;
 
 use clap::{Args, Parser, Subcommand};
-use lucyd_backtest::engine::{ExecParams, Metrics, QueueModel, Report, Strategy, write_journal};
+use lucyd_backtest::engine::{ExecParams, QueueModel, Report, Strategy, write_journal};
 use lucyd_backtest::export::{Format, export};
 use lucyd_backtest::{
     DataKinds, Error, Loader, MarketInfo, Request, default_cache_dir, parse_time,
 };
 
 /// Lucyd backtests: select markets, download their order book, CLOB fills, on-chain trades and
-/// prices, export the event stream, run a strategy.
+/// prices, export the event stream, run a strategy, view its report.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -64,9 +65,28 @@ enum Cmd {
         /// Write the full report as JSON.
         #[arg(long)]
         report: Option<PathBuf>,
+        /// Also write the report as HTML next to the JSON (same name, .html).
+        #[arg(long, requires = "report")]
+        html: bool,
         /// Write the own-order journal (.csv or .parquet).
         #[arg(long)]
         journal: Option<PathBuf>,
+    },
+    /// Turn a JSON report into one self-contained HTML page (works offline).
+    Html {
+        /// Report written by `run --report` or `Report::write_json`.
+        report: PathBuf,
+        /// Output file; default: the report's name with .html.
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+    /// Create a Cargo project with a strategy template that runs a backtest and writes reports.
+    New {
+        /// Folder to create; its name is the package name.
+        path: PathBuf,
+        /// Use a local checkout of lucyd-backtest instead of the git dependency.
+        #[arg(long)]
+        engine_path: Option<PathBuf>,
     },
 }
 
@@ -99,8 +119,15 @@ struct ExecArgs {
     /// Last share of the range for validation, 0 = none.
     #[arg(long)]
     validation_fraction: Option<f64>,
+    /// Seed of every random choice (jitter, reverts).
     #[arg(long)]
     seed: Option<u64>,
+    /// Step of the returns behind Sharpe and Sortino, ms (default 3600000, one hour).
+    #[arg(long)]
+    risk_interval_ms: Option<u64>,
+    /// Annualize Sharpe and Sortino (× √(intervals in 365 days)).
+    #[arg(long)]
+    annualize: bool,
 }
 
 impl ExecArgs {
@@ -145,6 +172,12 @@ impl ExecArgs {
         if let Some(v) = self.seed {
             p.seed = v;
         }
+        if let Some(v) = self.risk_interval_ms {
+            p.risk_interval_ms = v;
+        }
+        if self.annualize {
+            p.annualize = true;
+        }
         Ok(p)
     }
 }
@@ -166,45 +199,8 @@ fn strategy(name: &str, config: Option<&str>) -> lucyd_backtest::Result<Box<dyn 
     })
 }
 
-fn opt(v: Option<f64>, f: impl Fn(f64) -> String) -> String {
-    v.map(f).unwrap_or_else(|| "-".into())
-}
-
-fn print_metrics(title: &str, m: &Metrics) {
-    println!("{title}");
-    println!(
-        "  P&L {:+.2} USDC ({:+.2}%), equity {:.2} -> {:.2}, max drawdown {:.2} ({:.2}%)",
-        m.pnl, m.return_pct, m.start_equity, m.end_equity, m.max_drawdown, m.max_drawdown_pct
-    );
-    println!(
-        "  markets traded {}, won {}, win rate {}",
-        m.markets_traded,
-        m.markets_won,
-        opt(m.win_rate, |v| format!("{:.1}%", v * 100.0))
-    );
-    println!(
-        "  orders {} (rejected {}), fills {} (reverted {}), turnover {:.2}, fees {:.2}",
-        m.orders, m.rejected_orders, m.fills, m.reverted_fills, m.turnover, m.fees
-    );
-    println!(
-        "  taker orders {}, avg slippage {}; limit orders {}, filled {} ({})",
-        m.taker_orders,
-        opt(m.avg_slippage, |v| format!("{v:.4}")),
-        m.limit_orders,
-        m.limit_orders_filled,
-        opt(m.limit_fill_rate, |v| format!("{:.1}%", v * 100.0))
-    );
-}
-
 fn print_report(r: &Report) {
-    print_metrics(&format!("{}: whole range", r.strategy), &r.summary);
-    if let Some(p) = &r.periods {
-        let split = lucyd_backtest::chrono::DateTime::from_timestamp_millis(p.split_ms)
-            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_default();
-        print_metrics(&format!("fit (markets ending by {split})"), &p.fit);
-        print_metrics("validation", &p.validation);
-    }
+    print!("{}", r.summary_text());
     warn(&r.warnings);
 }
 
@@ -440,6 +436,7 @@ async fn run(cli: Cli) -> lucyd_backtest::Result<()> {
             config,
             exec,
             report,
+            html,
             journal,
         } => {
             let params = exec.build()?;
@@ -451,6 +448,11 @@ async fn run(cli: Cli) -> lucyd_backtest::Result<()> {
             if let Some(path) = report {
                 rep.write_json(&path)?;
                 println!("report -> {}", path.display());
+                if html {
+                    let h = path.with_extension("html");
+                    rep.write_html(&h)?;
+                    println!("html -> {}", h.display());
+                }
             }
             if let Some(path) = journal {
                 let fmt = Format::from_path(&path).ok_or_else(|| {
@@ -459,6 +461,22 @@ async fn run(cli: Cli) -> lucyd_backtest::Result<()> {
                 let n = write_journal(&rep.journal, &path, fmt)?;
                 println!("{n} journal row(s) -> {}", path.display());
             }
+        }
+        Cmd::Html { report, out } => {
+            let rep = Report::read_json(&report)?;
+            let out = out.unwrap_or_else(|| report.with_extension("html"));
+            rep.write_html(&out)?;
+            println!("html -> {}", out.display());
+        }
+        Cmd::New { path, engine_path } => {
+            let dir = scaffold::create(&path, engine_path.as_deref())?;
+            println!(
+                "created {0}
+  cd {0}
+  cargo run --release
+then open reports/report.html",
+                dir.display()
+            );
         }
     }
     Ok(())

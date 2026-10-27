@@ -10,10 +10,12 @@ use crate::trades::Side;
 
 use super::world::{Order, OrderState, TICKS, UNIT, World, canonical, tokens, usd};
 
+/// Id of an own order, unique within a run, from 1.
 pub type OrderId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+/// How long an order lives.
 pub enum TimeInForce {
     /// Rests in the book until filled, cancelled or the market ends.
     Gtc,
@@ -25,7 +27,9 @@ pub enum TimeInForce {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Liquidity {
+    /// Rested in the book and was taken.
     Maker,
+    /// Took liquidity on arrival.
     Taker,
 }
 
@@ -34,8 +38,11 @@ pub enum Liquidity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MatchType {
+    /// Same outcome, opposite sides: tokens change hands.
     Direct,
+    /// Two buys of opposite outcomes: a new pair of tokens is minted.
     Mint,
+    /// Two sells of opposite outcomes: the pair is merged back into USDC.
     Merge,
 }
 
@@ -44,7 +51,9 @@ pub enum MatchType {
 pub struct Resolution {
     /// 0 = up, 1 = down; None when voided.
     pub winner: Option<u8>,
+    /// The market got no oracle price in time: every token pays 0.5.
     pub voided: bool,
+    /// Final price of the underlying, USD.
     pub resolved_price: Option<f64>,
 }
 
@@ -53,6 +62,7 @@ pub struct Resolution {
 pub struct PriceView {
     /// USD.
     pub price: f64,
+    /// Pyth confidence interval, USD.
     pub conf: f64,
     /// Pyth publish time, ms.
     pub publish_ms: i64,
@@ -63,39 +73,67 @@ pub struct PriceView {
 /// News about an own order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderUpdate {
+    /// Which order.
     pub order_id: OrderId,
+    /// Market address.
     pub market: String,
+    /// When it happened, unix ms.
     pub ts_ms: i64,
     #[serde(flatten)]
+    /// What happened.
     pub kind: OrderUpdateKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+/// What happened to an own order; the JSON `status` field names the variant.
 pub enum OrderUpdateKind {
     /// In the book (or processed, for FAK).
     Accepted,
     /// Not taken: `market_not_open`, `order_notional_below_minimum`, `insufficient_balance`,
     /// `insufficient_tokens`.
-    Rejected { reason: String },
+    Rejected {
+        /// Why.
+        reason: String,
+    },
     /// Part or all of the order executed. `price` and `quantity` in the order's outcome.
     Filled {
+        /// 0 = up, 1 = down.
         outcome: u8,
+        /// Buy or sell.
         side: Side,
+        /// Execution price.
         price: f64,
+        /// Tokens filled now.
         quantity: f64,
+        /// Tokens left on the order.
         remaining: f64,
+        /// Maker or taker.
         liquidity: Liquidity,
+        /// How the CLOB settled it, if known.
         match_type: Option<MatchType>,
         /// USDC.
         fee: f64,
     },
     /// The settlement of the fill just reported failed: USDC and tokens are back.
-    SettlementFailed { price: f64, quantity: f64 },
+    SettlementFailed {
+        /// Price of the undone fill.
+        price: f64,
+        /// Tokens of the undone fill.
+        quantity: f64,
+    },
     /// Left the book: `cancelled`, `fak_remainder`, `self_trade`, `market_closed`.
-    Cancelled { remaining: f64, reason: String },
+    Cancelled {
+        /// Tokens left unfilled.
+        remaining: f64,
+        /// Why it left.
+        reason: String,
+    },
     /// The cancel missed: `unknown_order` (it reached the book before the order), `order_done`.
-    CancelFailed { reason: String },
+    CancelFailed {
+        /// Why.
+        reason: String,
+    },
 }
 
 /// How the strategy wants its book updates.
@@ -114,6 +152,7 @@ pub enum BookFeed {
 /// What the strategy receives besides own order updates, market opens, closes and resolutions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Subscriptions {
+    /// How often `on_book` is called.
     pub book: BookFeed,
     /// Recorded fills of other participants (`on_fill`).
     pub fills: bool,
@@ -143,33 +182,46 @@ pub trait Strategy {
     fn name(&self) -> String {
         "strategy".into()
     }
+    /// What the engine sends; by default nothing but order updates.
     fn subscriptions(&self) -> Subscriptions {
         Subscriptions::default()
     }
+    /// Once, before the first event.
     fn on_start(&mut self, ctx: &mut Ctx) {}
+    /// A market started trading.
     fn on_market_open(&mut self, ctx: &mut Ctx, market: &str) {}
+    /// The book of `market` changed (see [`Subscriptions::book`]).
     fn on_book(&mut self, ctx: &mut Ctx, market: &str) {}
     /// A recorded fill of the order book (another participant's match).
     fn on_fill(&mut self, ctx: &mut Ctx, fill: &Fill) {}
+    /// A Pyth tick of `feed` (needs [`Subscriptions::prices`]).
     fn on_price(&mut self, ctx: &mut Ctx, feed: &str, price: &PriceView) {}
+    /// Every [`Subscriptions::timer_ms`].
     fn on_timer(&mut self, ctx: &mut Ctx) {}
     /// Trading ended (`end`); the result is not known yet.
     fn on_market_close(&mut self, ctx: &mut Ctx, market: &str) {}
     /// The result reached the chain and positions were paid out.
     fn on_resolution(&mut self, ctx: &mut Ctx, market: &str, result: &Resolution) {}
+    /// News about an own order.
     fn on_order(&mut self, ctx: &mut Ctx, update: &OrderUpdate) {}
+    /// Once, after the last event.
     fn on_finish(&mut self, ctx: &mut Ctx) {}
 }
 
 /// A market as the strategy may see it now: no result before resolution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MarketView {
+    /// Market address.
     pub address: String,
+    /// Series.
     pub period: Period,
+    /// Underlying, e.g. `BTC`.
     pub instrument: String,
     /// Price feed, e.g. `btc-usd`.
     pub feed: Option<String>,
+    /// Trading start, unix ms.
     pub start_ms: i64,
+    /// Trading end, unix ms.
     pub end_ms: i64,
     /// USD; None before the market starts.
     pub strike: Option<f64>,
@@ -177,6 +229,7 @@ pub struct MarketView {
     pub open: bool,
     /// ms until `end`, never below 0.
     pub time_to_end_ms: i64,
+    /// Outcome names: `up`, `down`.
     pub outcomes: Vec<String>,
     /// Result, once resolved.
     pub resolution: Option<Resolution>,
@@ -185,25 +238,36 @@ pub struct MarketView {
 /// A price level: USDC per token and size in tokens.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Quote {
+    /// USDC per token.
     pub price: f64,
+    /// Tokens at that price.
     pub tokens: f64,
 }
 
 /// An own order that is on its way or in the book.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderView {
+    /// Order id.
     pub id: OrderId,
+    /// Market address.
     pub market: String,
+    /// 0 = up, 1 = down.
     pub outcome: u8,
+    /// Buy or sell.
     pub side: Side,
+    /// Limit price.
     pub price: f64,
+    /// GTC or FAK.
     pub tif: TimeInForce,
     /// Tokens.
     pub quantity: f64,
+    /// Tokens filled.
     pub filled: f64,
+    /// Tokens left.
     pub remaining: f64,
     /// Not in the book yet.
     pub pending: bool,
+    /// Placed by the strategy, unix ms.
     pub submitted_ms: i64,
 }
 
@@ -211,14 +275,19 @@ pub struct OrderView {
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum OrderError {
     #[error("unknown market {0}")]
+    /// No market with this address in the run.
     UnknownMarket(String),
     #[error("outcome {0}: 0 = up, 1 = down")]
+    /// Outcome is not 0 or 1.
     BadOutcome(u8),
     #[error("price {0} is off the 0.0025 grid or outside (0, 1)")]
+    /// Price outside 0.0025..0.9975 or off the 0.0025 grid.
     BadPrice(f64),
     #[error("quantity must be at least one whole token")]
+    /// Zero tokens.
     ZeroQuantity,
     #[error("unknown order {0}")]
+    /// No such order.
     UnknownOrder(OrderId),
 }
 
@@ -235,6 +304,7 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    /// Current time of the run, unix ms.
     pub fn now_ms(&self) -> i64 {
         self.world.now
     }
@@ -278,6 +348,7 @@ impl Ctx<'_> {
             .collect()
     }
 
+    /// A market by address, if it is in the run.
     pub fn market(&self, market: &str) -> Option<MarketView> {
         self.index(market).map(|i| self.view(i))
     }
