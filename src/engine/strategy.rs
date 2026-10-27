@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::book::{OrderBook, TICK, price_ticks, tick_price};
+use crate::book::{BookSide, OrderBook, TICK, price_ticks, tick_price};
 use crate::fills::Fill;
 use crate::request::Period;
 use crate::trades::Side;
@@ -330,7 +330,11 @@ impl Ctx<'_> {
     }
 
     fn index(&self, market: &str) -> Option<usize> {
-        self.world.index.get(&market.to_ascii_lowercase()).copied()
+        let index = &self.world.index;
+        index
+            .get(market)
+            .or_else(|| index.get(&market.to_ascii_lowercase()))
+            .copied()
     }
 
     /// Every market of the run, in catalog order.
@@ -342,10 +346,15 @@ impl Ctx<'_> {
 
     /// Markets trading now.
     pub fn open_markets(&self) -> Vec<MarketView> {
-        (0..self.world.markets.len())
+        let mut open: Vec<usize> = self
+            .world
+            .active
+            .iter()
+            .copied()
             .filter(|&i| self.world.markets[i].open_at(self.world.now))
-            .map(|i| self.view(i))
-            .collect()
+            .collect();
+        open.sort_unstable();
+        open.into_iter().map(|i| self.view(i)).collect()
     }
 
     /// A market by address, if it is in the run.
@@ -363,18 +372,26 @@ impl Ctx<'_> {
 
     /// Best bid of an outcome as the feed shows it now.
     pub fn best_bid(&self, market: &str, outcome: u8) -> Option<Quote> {
-        let (p, s) = self.book(market)?.outcome(outcome)?.best_bid()?;
-        Some(Quote {
-            price: p,
-            tokens: tokens(s),
-        })
+        self.top(market, outcome, BookSide::Bid)
     }
 
     /// Best ask of an outcome as the feed shows it now.
     pub fn best_ask(&self, market: &str, outcome: u8) -> Option<Quote> {
-        let (p, s) = self.book(market)?.outcome(outcome)?.best_ask()?;
+        self.top(market, outcome, BookSide::Ask)
+    }
+
+    /// The top of the book without building the book.
+    fn top(&self, market: &str, outcome: u8, side: BookSide) -> Option<Quote> {
+        if outcome > 1 {
+            return None;
+        }
+        let m = &self.world.markets[self.index(market)?];
+        if !m.has_book {
+            return None;
+        }
+        let (t, s) = m.top(outcome, side)?;
         Some(Quote {
-            price: p,
+            price: tick_price(t),
             tokens: tokens(s),
         })
     }
@@ -411,9 +428,9 @@ impl Ctx<'_> {
     pub fn open_orders(&self, market: Option<&str>) -> Vec<OrderView> {
         let only = market.map(|m| self.index(m));
         self.world
-            .orders
-            .values()
-            .filter(|o| o.state != OrderState::Done)
+            .live
+            .iter()
+            .map(|id| &self.world.orders[id])
             .filter(|o| only.is_none_or(|i| i == Some(o.market)))
             .map(|o| OrderView {
                 id: o.id,

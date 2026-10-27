@@ -219,42 +219,95 @@ pub struct BookHistory {
     pub updates: Vec<BookUpdate>,
 }
 
+/// The level a book row carries.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RowLevel {
+    /// A field is empty (an empty snapshot).
+    None,
+    /// Not a token of the market, or an unknown side.
+    Unknown,
+    Level(Level),
+}
+
 /// One row of the book file.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BookRow {
     pub ts_ms: i64,
     pub sequence: u64,
     pub snapshot: bool,
-    pub asset_id: Option<String>,
-    pub side: Option<String>,
-    pub price: Option<f64>,
-    pub size: Option<u64>,
+    pub level: RowLevel,
 }
 
-pub(crate) fn read_rows(file: Bytes) -> Result<Vec<BookRow>> {
+/// The level of a row's `asset_id`, `side`, `price` and `size`.
+pub(crate) fn row_level(
+    market: &MarketInfo,
+    asset_id: Option<&str>,
+    side: Option<&str>,
+    price: Option<f64>,
+    size: Option<u64>,
+) -> RowLevel {
+    let (Some(a), Some(side), Some(price), Some(size)) = (asset_id, side, price, size) else {
+        return RowLevel::None;
+    };
+    let side = match side {
+        "bid" => Some(BookSide::Bid),
+        "ask" => Some(BookSide::Ask),
+        _ => None,
+    };
+    match side.zip(market.outcome_of(a)) {
+        Some((side, outcome)) => RowLevel::Level(Level {
+            outcome,
+            side,
+            price: tick_price(price_ticks(price)),
+            size,
+        }),
+        None => RowLevel::Unknown,
+    }
+}
+
+const BOOK_COLUMNS: [&str; 7] = [
+    "timestamp",
+    "state_sequence",
+    "kind",
+    "asset_id",
+    "side",
+    "price",
+    "size",
+];
+
+/// Rows of a market's book file. Reads the arrays in place: no string per row.
+pub(crate) fn read_rows(market: &MarketInfo, file: Bytes) -> Result<Vec<BookRow>> {
+    use arrow_array::{Array, Float64Array, StringArray, UInt64Array};
+    fn s(c: &StringArray, i: usize) -> Option<&str> {
+        c.is_valid(i).then(|| c.value(i))
+    }
     let what = "book file";
     let mut rows = Vec::new();
-    for b in pq::read_batches(file, what)? {
+    for b in pq::read_columns(file, what, &BOOK_COLUMNS)? {
         let ts = pq::ts(&b, "timestamp", what)?;
-        let seq = pq::u64s(&b, "state_sequence", what)?;
-        let kind = pq::strs(&b, "kind", what)?;
-        let asset = pq::strs(&b, "asset_id", what)?;
-        let side = pq::strs(&b, "side", what)?;
-        let price = pq::f64s(&b, "price", what)?;
-        let size = pq::u64s(&b, "size", what)?;
-        for i in 0..b.num_rows() {
+        let seq = pq::col::<UInt64Array>(&b, "state_sequence", what)?;
+        let kind = pq::col::<StringArray>(&b, "kind", what)?;
+        let asset = pq::col::<StringArray>(&b, "asset_id", what)?;
+        let side = pq::col::<StringArray>(&b, "side", what)?;
+        let price = pq::col::<Float64Array>(&b, "price", what)?;
+        let size = pq::col::<UInt64Array>(&b, "size", what)?;
+        rows.reserve(b.num_rows());
+        for (i, &ts_ms) in ts.iter().enumerate() {
             rows.push(BookRow {
-                ts_ms: ts[i],
-                sequence: seq[i].unwrap_or(0),
-                snapshot: match kind[i].as_deref() {
+                ts_ms,
+                sequence: if seq.is_valid(i) { seq.value(i) } else { 0 },
+                snapshot: match s(kind, i) {
                     Some("snapshot") => true,
                     Some("delta") => false,
                     k => return Err(bad(what, format!("unknown kind {k:?}"))),
                 },
-                asset_id: asset[i].clone(),
-                side: side[i].clone(),
-                price: price[i],
-                size: size[i],
+                level: row_level(
+                    market,
+                    s(asset, i),
+                    s(side, i),
+                    price.is_valid(i).then(|| price.value(i)),
+                    size.is_valid(i).then(|| size.value(i)),
+                ),
             });
         }
     }
@@ -265,29 +318,19 @@ impl BookHistory {
     /// Groups rows into updates: rows of one snapshot share the timestamp; rows of one delta
     /// share the timestamp and the sequence. Rows of unknown tokens are skipped and counted.
     pub(crate) fn from_rows(market: &MarketInfo, mut rows: Vec<BookRow>) -> (Self, usize) {
-        rows.sort_by_key(|r| (r.ts_ms, r.sequence));
+        if !rows.is_sorted_by_key(|r| (r.ts_ms, r.sequence)) {
+            rows.sort_by_key(|r| (r.ts_ms, r.sequence));
+        }
         let mut updates: Vec<BookUpdate> = Vec::new();
         let mut skipped = 0;
         for r in rows {
-            let level = match (&r.asset_id, r.side.as_deref(), r.price, r.size) {
-                (Some(a), Some(side), Some(price), Some(size)) => {
-                    let side = match side {
-                        "bid" => Some(BookSide::Bid),
-                        "ask" => Some(BookSide::Ask),
-                        _ => None,
-                    };
-                    let level = side.zip(market.outcome_of(a)).map(|(side, outcome)| Level {
-                        outcome,
-                        side,
-                        price: tick_price(price_ticks(price)),
-                        size,
-                    });
-                    if level.is_none() {
-                        skipped += 1;
-                    }
-                    level
+            let level = match r.level {
+                RowLevel::Level(l) => Some(l),
+                RowLevel::Unknown => {
+                    skipped += 1;
+                    None
                 }
-                _ => None,
+                RowLevel::None => None,
             };
             let same = match updates.last_mut() {
                 Some(BookUpdate::Snapshot { ts_ms, levels, .. })
@@ -400,10 +443,10 @@ pub(crate) mod tests {
             ts_ms: ts,
             sequence: seq,
             snapshot: snap,
-            asset_id: lvl.map(|l| m.outcome_ids[l.0 as usize].clone()),
-            side: lvl.map(|l| l.1.to_string()),
-            price: lvl.map(|l| l.2),
-            size: lvl.map(|l| l.3),
+            level: lvl.map_or(RowLevel::None, |l| {
+                let asset = m.outcome_ids[l.0 as usize].as_str();
+                row_level(m, Some(asset), Some(l.1), Some(l.2), Some(l.3))
+            }),
         }
     }
 
@@ -459,8 +502,9 @@ pub(crate) mod tests {
     #[test]
     fn unknown_tokens_are_skipped() {
         let m = market();
-        let mut r = row(&m, 1, 1, true, Some((0, "bid", 0.5, 1)));
-        r.asset_id = Some("0xdead".into());
+        let mut r = row(&m, 1, 1, true, None);
+        r.level = row_level(&m, Some("0xdead"), Some("bid"), Some(0.5), Some(1));
+        assert_eq!(r.level, RowLevel::Unknown);
         let (h, skipped) = BookHistory::from_rows(&m, vec![r]);
         assert_eq!(skipped, 1);
         assert!(matches!(&h.updates[0], BookUpdate::Snapshot { levels, .. } if levels.is_empty()));

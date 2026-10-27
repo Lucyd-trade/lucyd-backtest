@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 
 /// The API allows 20 requests per second per IP; stay well below.
 const API_RATE: u32 = 8;
-const DATA_RATE: u32 = 16;
+const DATA_RATE: u32 = 40;
 const ATTEMPTS: u32 = 7;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::book::{BookUpdate, Level};
 use crate::fills::Fill;
 use crate::loader::Dataset;
+use crate::prices::PriceTick;
 use crate::trades::Trade;
 
 /// One event. Events are sorted by `ts_ms`, then by kind (see [`EventKind::rank`]), then by
@@ -112,168 +113,263 @@ impl EventKind {
     }
 }
 
-/// Sort key: time, kind, market or feed, then order within the source.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Key {
-    ts_ms: i64,
+/// Sort key: time, kind, market or feed (by name), then order within the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Key {
+    pub ts_ms: i64,
     rank: u8,
-    source: String,
+    source: u32,
     a: u64,
     b: u64,
 }
 
-fn sort_events(mut items: Vec<(Key, Event)>) -> Vec<Event> {
-    items.sort_by(|x, y| x.0.cmp(&y.0));
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(i, (_, mut e))| {
-            e.seq = i as u64;
-            e
-        })
-        .collect()
+/// Where an event's data lives in the dataset: market index, then the item's index.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Src {
+    Open(usize),
+    Close(usize),
+    /// The book rebuilt at the range start (`Stream::synthetic`).
+    Synthetic(usize),
+    Book(usize, usize),
+    Fill(usize, usize),
+    Trade(usize, usize),
+    /// Feed index in `Dataset::prices` order, tick index.
+    Price(usize, usize),
 }
 
-/// Builds the stream of a loaded dataset, clipped to the request range.
-pub(crate) fn build(ds: &Dataset) -> Vec<Event> {
-    let req = &ds.request;
-    let from_ms = req.from.map(|t| t.timestamp_millis());
-    let in_range = |ms: i64| {
-        from_ms.is_none_or(|f| ms >= f) && req.to.is_none_or(|t| ms < t.timestamp_millis())
-    };
-    let mut out: Vec<(Key, Event)> = Vec::new();
-    let mut push =
-        |ts_ms: i64, source: &str, a: u64, b: u64, market: Option<&str>, kind: EventKind| {
-            let key = Key {
-                ts_ms,
-                rank: kind.rank(),
-                source: source.to_string(),
-                a,
-                b,
-            };
-            out.push((
-                key,
-                Event {
-                    seq: 0,
-                    ts_ms,
-                    market: market.map(str::to_string),
-                    kind,
-                },
-            ));
-        };
+/// An event borrowed from the dataset.
+pub(crate) enum Ev<'a> {
+    MarketOpen(usize),
+    PriceTick(&'a str, &'a PriceTick),
+    Book {
+        market: usize,
+        levels: &'a [Level],
+        snapshot: bool,
+        synthetic: bool,
+    },
+    Fill(usize, &'a Fill),
+    Trade(usize, &'a Trade),
+    MarketClose(usize),
+}
 
-    for m in &ds.markets {
-        let info = &m.info;
-        let addr = info.address.as_str();
-        let start = info.start.timestamp_millis();
-        let end = info.end.timestamp_millis();
-        if in_range(start) {
-            push(
-                start,
-                addr,
-                0,
-                0,
-                Some(addr),
-                EventKind::MarketOpen {
-                    strike: info.strike,
-                },
-            );
-        }
-        if in_range(end) {
-            let close = EventKind::MarketClose {
-                winner: info.winner,
-                resolved_price: info.resolved_price,
-                voided: info.voided,
-            };
-            push(end, addr, 0, 0, Some(addr), close);
-        }
-        if let Some(h) = &m.book {
-            // The range starts in the middle of the history: begin with the book as it was.
-            if let Some(f) = from_ms
-                && h.first_ts_ms().is_some_and(|t| t < f)
-                && let Some(book) = h.at(f - 1)
-            {
-                let kind = EventKind::BookSnapshot {
-                    levels: book.levels(),
-                    synthetic: true,
-                };
-                push(f, addr, 0, 0, Some(addr), kind);
-            }
-            for (i, u) in h.updates.iter().enumerate() {
-                if !in_range(u.ts_ms()) {
-                    continue;
-                }
-                let kind = match u {
-                    BookUpdate::Snapshot { levels, .. } => EventKind::BookSnapshot {
-                        levels: levels.clone(),
-                        synthetic: false,
-                    },
-                    BookUpdate::Delta { changes, .. } => EventKind::BookDelta {
-                        changes: changes.clone(),
-                    },
-                };
-                push(u.ts_ms(), addr, u.sequence(), i as u64, Some(addr), kind);
-            }
-        }
-        for f in m.fills.iter().flatten() {
-            if in_range(f.ts_ms) {
-                push(
-                    f.ts_ms,
-                    addr,
-                    f.journal_id.max(0) as u64,
-                    0,
-                    Some(addr),
-                    EventKind::Fill { fill: f.clone() },
-                );
-            }
-        }
-        for t in m.trades.iter().flatten() {
-            let ms = t.block_time.timestamp_millis();
-            if in_range(ms) {
-                push(
-                    ms,
-                    addr,
-                    t.block_number,
-                    t.log_index,
-                    Some(addr),
-                    EventKind::Trade { trade: t.clone() },
-                );
-            }
-        }
+/// The stream of a dataset in order, as positions in the dataset: nothing is copied.
+pub(crate) struct Stream<'a> {
+    ds: &'a Dataset,
+    feeds: Vec<(&'a str, &'a [PriceTick])>,
+    synthetic: Vec<Vec<Level>>,
+    pub order: Vec<(Key, Src)>,
+}
+
+const RANK_OPEN: u8 = 0;
+const RANK_PRICE: u8 = 1;
+const RANK_SYNTHETIC: u8 = 2;
+const RANK_BOOK: u8 = 3;
+const RANK_FILL: u8 = 4;
+const RANK_TRADE: u8 = 5;
+const RANK_CLOSE: u8 = 6;
+
+fn key(ts_ms: i64, rank: u8, source: u32, a: u64, b: u64) -> Key {
+    Key {
+        ts_ms,
+        rank,
+        source,
+        a,
+        b,
     }
-    for (feed, ticks) in &ds.prices {
-        // Files hold whole days: keep the ticks from the first start to the last end of the
-        // markets on this feed.
-        let lives = ds
+}
+
+impl<'a> Stream<'a> {
+    /// The stream of a loaded dataset, clipped to the request range.
+    pub fn new(ds: &'a Dataset) -> Self {
+        let req = &ds.request;
+        let from_ms = req.from.map(|t| t.timestamp_millis());
+        let to_ms = req.to.map(|t| t.timestamp_millis());
+        let in_range = |ms: i64| from_ms.is_none_or(|f| ms >= f) && to_ms.is_none_or(|t| ms < t);
+        // Sources sort by name: markets by address, feeds by feed name.
+        let mut names: Vec<&str> = ds
             .markets
             .iter()
-            .filter(|m| m.info.feed_slug().as_deref() == Some(feed));
-        let (first, last) = lives.fold((i64::MAX, i64::MIN), |(a, b), m| {
-            (
-                a.min(m.info.start.timestamp_millis()),
-                b.max(m.info.end.timestamp_millis()),
-            )
-        });
-        for t in ticks {
-            if in_range(t.receive_ms) && (first..=last).contains(&t.receive_ms) {
+            .map(|m| m.info.address.as_str())
+            .chain(ds.prices.keys().map(String::as_str))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        let source = |name: &str| names.binary_search(&name).expect("known source") as u32;
+
+        let mut order: Vec<(Key, Src)> = Vec::new();
+        let mut synthetic = vec![Vec::new(); ds.markets.len()];
+        for (mi, m) in ds.markets.iter().enumerate() {
+            let info = &m.info;
+            let src = source(&info.address);
+            let start = info.start.timestamp_millis();
+            let end = info.end.timestamp_millis();
+            if in_range(start) {
+                order.push((key(start, RANK_OPEN, src, 0, 0), Src::Open(mi)));
+            }
+            if in_range(end) {
+                order.push((key(end, RANK_CLOSE, src, 0, 0), Src::Close(mi)));
+            }
+            if let Some(h) = &m.book {
+                // The range starts in the middle of the history: begin with the book as it was.
+                if let Some(f) = from_ms
+                    && h.first_ts_ms().is_some_and(|t| t < f)
+                    && let Some(book) = h.at(f - 1)
+                {
+                    synthetic[mi] = book.levels();
+                    order.push((key(f, RANK_SYNTHETIC, src, 0, 0), Src::Synthetic(mi)));
+                }
+                for (i, u) in h.updates.iter().enumerate() {
+                    if in_range(u.ts_ms()) {
+                        let k = key(u.ts_ms(), RANK_BOOK, src, u.sequence(), i as u64);
+                        order.push((k, Src::Book(mi, i)));
+                    }
+                }
+            }
+            for (i, f) in m.fills.iter().flatten().enumerate() {
+                if in_range(f.ts_ms) {
+                    let k = key(f.ts_ms, RANK_FILL, src, f.journal_id.max(0) as u64, 0);
+                    order.push((k, Src::Fill(mi, i)));
+                }
+            }
+            for (i, t) in m.trades.iter().flatten().enumerate() {
+                let ms = t.block_time.timestamp_millis();
+                if in_range(ms) {
+                    let k = key(ms, RANK_TRADE, src, t.block_number, t.log_index);
+                    order.push((k, Src::Trade(mi, i)));
+                }
+            }
+        }
+        let mut feeds = Vec::new();
+        for (fi, (feed, ticks)) in ds.prices.iter().enumerate() {
+            feeds.push((feed.as_str(), ticks.as_slice()));
+            // Files hold whole days: keep the ticks from the first start to the last end of the
+            // markets on this feed.
+            let lives = ds
+                .markets
+                .iter()
+                .filter(|m| m.info.feed_slug().as_deref() == Some(feed));
+            let (first, last) = lives.fold((i64::MAX, i64::MIN), |(a, b), m| {
+                (
+                    a.min(m.info.start.timestamp_millis()),
+                    b.max(m.info.end.timestamp_millis()),
+                )
+            });
+            let src = source(feed);
+            for (i, t) in ticks.iter().enumerate() {
+                if in_range(t.receive_ms) && (first..=last).contains(&t.receive_ms) {
+                    let (a, b) = (t.publish_ms as u64, t.slot.unwrap_or(0));
+                    order.push((key(t.receive_ms, RANK_PRICE, src, a, b), Src::Price(fi, i)));
+                }
+            }
+        }
+        // Stable; the sources come as already sorted runs, which the sort only merges.
+        order.sort_by_key(|x| x.0);
+        Stream {
+            ds,
+            feeds,
+            synthetic,
+            order,
+        }
+    }
+
+    /// The event at `src`, borrowed.
+    pub fn get(&self, src: Src) -> Ev<'_> {
+        let ds = self.ds;
+        match src {
+            Src::Open(m) => Ev::MarketOpen(m),
+            Src::Close(m) => Ev::MarketClose(m),
+            Src::Synthetic(m) => Ev::Book {
+                market: m,
+                levels: &self.synthetic[m],
+                snapshot: true,
+                synthetic: true,
+            },
+            Src::Book(m, i) => {
+                let u = &ds.markets[m].book.as_ref().expect("book").updates[i];
+                let (levels, snapshot) = match u {
+                    BookUpdate::Snapshot { levels, .. } => (levels, true),
+                    BookUpdate::Delta { changes, .. } => (changes, false),
+                };
+                Ev::Book {
+                    market: m,
+                    levels,
+                    snapshot,
+                    synthetic: false,
+                }
+            }
+            Src::Fill(m, i) => Ev::Fill(m, &ds.markets[m].fills.as_ref().expect("fills")[i]),
+            Src::Trade(m, i) => Ev::Trade(m, &ds.markets[m].trades.as_ref().expect("trades")[i]),
+            Src::Price(f, i) => Ev::PriceTick(self.feeds[f].0, &self.feeds[f].1[i]),
+        }
+    }
+
+    /// The owned event of the public stream.
+    fn event(&self, seq: u64, ts_ms: i64, src: Src) -> Event {
+        let ds = self.ds;
+        let addr = |m: usize| Some(ds.markets[m].info.address.clone());
+        let (market, kind) = match self.get(src) {
+            Ev::MarketOpen(m) => (
+                addr(m),
+                EventKind::MarketOpen {
+                    strike: ds.markets[m].info.strike,
+                },
+            ),
+            Ev::MarketClose(m) => {
+                let info = &ds.markets[m].info;
+                let kind = EventKind::MarketClose {
+                    winner: info.winner,
+                    resolved_price: info.resolved_price,
+                    voided: info.voided,
+                };
+                (addr(m), kind)
+            }
+            Ev::Book {
+                market,
+                levels,
+                snapshot,
+                synthetic,
+            } => {
+                let kind = if snapshot {
+                    EventKind::BookSnapshot {
+                        levels: levels.to_vec(),
+                        synthetic,
+                    }
+                } else {
+                    EventKind::BookDelta {
+                        changes: levels.to_vec(),
+                    }
+                };
+                (addr(market), kind)
+            }
+            Ev::Fill(m, f) => (addr(m), EventKind::Fill { fill: f.clone() }),
+            Ev::Trade(m, t) => (addr(m), EventKind::Trade { trade: t.clone() }),
+            Ev::PriceTick(feed, t) => {
                 let kind = EventKind::PriceTick {
-                    feed: feed.clone(),
+                    feed: feed.to_string(),
                     price: t.price,
                     conf: t.conf,
                     publish_ms: t.publish_ms,
                 };
-                push(
-                    t.receive_ms,
-                    feed,
-                    t.publish_ms as u64,
-                    t.slot.unwrap_or(0),
-                    None,
-                    kind,
-                );
+                (None, kind)
             }
+        };
+        Event {
+            seq,
+            ts_ms,
+            market,
+            kind,
         }
     }
-    sort_events(out)
+}
+
+/// Builds the stream of a loaded dataset, clipped to the request range.
+pub(crate) fn build(ds: &Dataset) -> Vec<Event> {
+    let s = Stream::new(ds);
+    s.order
+        .iter()
+        .enumerate()
+        .map(|(i, (k, src))| s.event(i as u64, k.ts_ms, *src))
+        .collect()
 }
 
 #[cfg(test)]

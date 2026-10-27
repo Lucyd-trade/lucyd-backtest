@@ -7,7 +7,7 @@
 //! ladder (in up prices) and maps every order and every recorded fill onto it: a buy of up meets
 //! a buy of down (mint) or a sell of up (direct) in the same queue, exactly as the CLOB does.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use crate::book::{BookSide, Level, OrderBook, OutcomeBook, tick_price};
 use crate::fills::Fill;
@@ -90,6 +90,80 @@ fn better(side: BookSide, a: u32, b: u32) -> bool {
     }
 }
 
+/// One side of the recorded ladder: (tick, size) ascending by tick, no zero sizes. A book has
+/// tens of levels, so a sorted vector beats a tree.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Ladder(Vec<(u32, u64)>);
+
+impl Ladder {
+    fn get(&self, t: u32) -> u64 {
+        match self.0.binary_search_by_key(&t, |l| l.0) {
+            Ok(i) => self.0[i].1,
+            Err(_) => 0,
+        }
+    }
+
+    fn set(&mut self, t: u32, size: u64) {
+        match (self.0.binary_search_by_key(&t, |l| l.0), size) {
+            (Ok(i), 0) => {
+                self.0.remove(i);
+            }
+            (Ok(i), s) => self.0[i].1 = s,
+            (Err(_), 0) => {}
+            (Err(i), s) => self.0.insert(i, (t, s)),
+        }
+    }
+
+    fn levels(&self) -> &[(u32, u64)] {
+        &self.0
+    }
+
+    fn low(&self) -> Option<u32> {
+        self.0.first().map(|l| l.0)
+    }
+
+    fn high(&self) -> Option<u32> {
+        self.0.last().map(|l| l.0)
+    }
+}
+
+/// Own orders by id. Ids are issued from 1 in order and every one is submitted, so the order
+/// with id `n` sits at `n - 1`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Orders(Vec<Order>);
+
+impl Orders {
+    pub fn get(&self, id: &OrderId) -> Option<&Order> {
+        id.checked_sub(1).and_then(|i| self.0.get(i as usize))
+    }
+
+    pub fn get_mut(&mut self, id: &OrderId) -> Option<&mut Order> {
+        id.checked_sub(1).and_then(|i| self.0.get_mut(i as usize))
+    }
+
+    fn insert(&mut self, o: Order) {
+        assert_eq!(
+            o.id,
+            self.0.len() as u64 + 1,
+            "order ids are issued in order"
+        );
+        self.0.push(o);
+    }
+
+    /// All orders, by id.
+    pub fn values(&self) -> std::slice::Iter<'_, Order> {
+        self.0.iter()
+    }
+}
+
+impl std::ops::Index<&OrderId> for Orders {
+    type Output = Order;
+
+    fn index(&self, id: &OrderId) -> &Order {
+        self.get(id).expect("order exists")
+    }
+}
+
 /// Liquidity the engine's own orders took from a recorded level, until the recording shows the
 /// level anew.
 #[derive(Debug, Clone, Copy)]
@@ -162,7 +236,7 @@ pub(crate) struct Mkt {
     pub info: MarketInfo,
     pub feed: Option<String>,
     /// Canonical ladder as recorded: bids and asks by tick.
-    book: [BTreeMap<u32, u64>; 2],
+    book: [Ladder; 2],
     pub has_book: bool,
     eaten: BTreeMap<(BookSide, u32), Eaten>,
     /// Recorded fills not yet seen in the book: (time, size) per level.
@@ -185,7 +259,7 @@ impl Mkt {
         Mkt {
             feed: info.feed_slug(),
             info,
-            book: [BTreeMap::new(), BTreeMap::new()],
+            book: [Ladder::default(), Ladder::default()],
             has_book: false,
             eaten: BTreeMap::new(),
             unseen_fills: BTreeMap::new(),
@@ -206,20 +280,42 @@ impl Mkt {
             && now < self.info.end.timestamp_millis()
     }
 
-    fn visible(&self, side: BookSide, t: u32) -> u64 {
-        let recorded = self.book[idx(side)].get(&t).copied().unwrap_or(0);
+    /// `recorded` at `t` minus what own orders took there.
+    fn visible_of(&self, side: BookSide, t: u32, recorded: u64) -> u64 {
+        if self.eaten.is_empty() {
+            return recorded;
+        }
         let eaten = self.eaten.get(&(side, t)).map_or(0, |e| e.amount);
         recorded.saturating_sub(eaten)
     }
 
-    fn best_visible(&self, side: BookSide) -> Option<u32> {
-        let mut levels: Box<dyn Iterator<Item = (&u32, &u64)>> = match side {
-            BookSide::Bid => Box::new(self.book[0].iter().rev()),
-            BookSide::Ask => Box::new(self.book[1].iter()),
+    fn visible(&self, side: BookSide, t: u32) -> u64 {
+        self.visible_of(side, t, self.book[idx(side)].get(t))
+    }
+
+    /// Best price of a canonical side with visible size: (ticks, size).
+    fn best_visible_level(&self, side: BookSide) -> Option<(u32, u64)> {
+        let levels = self.book[idx(side)].levels();
+        let vis = |&(t, s): &(u32, u64)| {
+            let v = self.visible_of(side, t, s);
+            (v > 0).then_some((t, v))
         };
-        levels
-            .find(|(t, _)| self.visible(side, **t) > 0)
-            .map(|(t, _)| *t)
+        match side {
+            BookSide::Bid => levels.iter().rev().find_map(vis),
+            BookSide::Ask => levels.iter().find_map(vis),
+        }
+    }
+
+    fn best_visible(&self, side: BookSide) -> Option<u32> {
+        self.best_visible_level(side).map(|l| l.0)
+    }
+
+    /// Best visible level of `outcome`'s `side` as the feed shows it: (ticks of the outcome,
+    /// size). Down's bids are the mirrored canonical asks and its asks the mirrored bids.
+    pub fn top(&self, outcome: u8, side: BookSide) -> Option<(u32, u64)> {
+        let cside = if outcome == 0 { side } else { opposite(side) };
+        let (t, v) = self.best_visible_level(cside)?;
+        Some((outcome_ticks(outcome, t), v))
     }
 
     /// The book as the feed would show it now: recorded levels minus what own orders took, for
@@ -228,8 +324,8 @@ impl Mkt {
         let mut up = OutcomeBook::default();
         let mut down = OutcomeBook::default();
         for side in [BookSide::Bid, BookSide::Ask] {
-            for &t in self.book[idx(side)].keys() {
-                let v = self.visible(side, t);
+            for &(t, s) in self.book[idx(side)].levels() {
+                let v = self.visible_of(side, t, s);
                 if v == 0 {
                     continue;
                 }
@@ -264,8 +360,8 @@ impl Mkt {
     /// Mark of up, micro-USDC per token: mid of the recorded book, one side of it, the last
     /// recorded fill, or 0.5.
     pub fn mark_up(&self) -> i64 {
-        let bid = self.book[0].keys().next_back().copied();
-        let ask = self.book[1].keys().next().copied();
+        let bid = self.book[0].high();
+        let ask = self.book[1].low();
         let t2 = match (bid, ask) {
             (Some(b), Some(a)) => b + a,
             (Some(x), None) | (None, Some(x)) => 2 * x,
@@ -295,6 +391,15 @@ impl Account {
 
     pub fn free_tokens(&self, m: usize, o: u8) -> i64 {
         self.position(m, o) - self.reserved_tokens.get(&(m, o)).copied().unwrap_or(0) as i64
+    }
+
+    /// Changes a balance; a balance back at 0 leaves the map, so walks over it stay short.
+    fn add_tokens(&mut self, key: (usize, u8), delta: i64) {
+        let v = self.tokens.entry(key).or_default();
+        *v += delta;
+        if *v == 0 {
+            self.tokens.remove(&key);
+        }
     }
 }
 
@@ -337,9 +442,18 @@ pub struct JournalRow {
 pub(crate) struct World {
     pub params: ExecParams,
     pub markets: Vec<Mkt>,
-    pub index: BTreeMap<String, usize>,
+    pub index: HashMap<String, usize>,
     pub prices: BTreeMap<String, PriceView>,
-    pub orders: BTreeMap<OrderId, Order>,
+    pub orders: Orders,
+    /// Orders not done yet (pending or live), by id.
+    pub live: BTreeSet<OrderId>,
+    /// Markets by start time, and how many of them have started.
+    by_start: Vec<usize>,
+    started: usize,
+    /// Started markets that had not ended at the last prune (a superset of the open ones).
+    pub active: Vec<usize>,
+    /// Earliest end among `active`: the next prune.
+    prune_at: i64,
     pub acct: Account,
     pub journal: Vec<JournalRow>,
     pub rng: Rng,
@@ -358,6 +472,8 @@ impl World {
             .enumerate()
             .map(|(i, m)| (m.info.address.clone(), i))
             .collect();
+        let mut by_start: Vec<usize> = (0..markets.len()).collect();
+        by_start.sort_by_key(|&i| markets[i].info.start);
         World {
             acct: Account {
                 usdc: (params.initial_usdc * UNIT as f64).round() as i64,
@@ -368,11 +484,43 @@ impl World {
             markets,
             index,
             prices: BTreeMap::new(),
-            orders: BTreeMap::new(),
+            orders: Orders::default(),
+            live: BTreeSet::new(),
+            by_start,
+            started: 0,
+            active: Vec::new(),
+            prune_at: i64::MAX,
             journal: Vec::new(),
             now: 0,
             updates: Vec::new(),
             token_moves: 0,
+        }
+    }
+
+    /// Moves the clock (never back) and keeps `active` up to date.
+    pub fn set_now(&mut self, t: i64) {
+        self.now = self.now.max(t);
+        let now = self.now;
+        while let Some(&m) = self.by_start.get(self.started) {
+            if self.markets[m].info.start.timestamp_millis() > now {
+                break;
+            }
+            self.active.push(m);
+            self.prune_at = self
+                .prune_at
+                .min(self.markets[m].info.end.timestamp_millis());
+            self.started += 1;
+        }
+        if now >= self.prune_at {
+            let markets = &self.markets;
+            self.active
+                .retain(|&m| now < markets[m].info.end.timestamp_millis());
+            self.prune_at = self
+                .active
+                .iter()
+                .map(|&m| markets[m].info.end.timestamp_millis())
+                .min()
+                .unwrap_or(i64::MAX);
         }
     }
 
@@ -396,10 +544,18 @@ impl World {
         }
     }
 
-    fn update(&mut self, o: &Order, kind: OrderUpdateKind) {
+    /// Journals an event of order `id`; `edit` fills in the event's own fields.
+    fn log(&mut self, event: &str, id: OrderId, edit: impl FnOnce(&mut JournalRow)) {
+        let mut row = self.row(event, &self.orders[&id]);
+        edit(&mut row);
+        self.journal.push(row);
+    }
+
+    fn update(&mut self, id: OrderId, kind: OrderUpdateKind) {
+        let m = self.orders[&id].market;
         self.updates.push(OrderUpdate {
-            order_id: o.id,
-            market: self.markets[o.market].info.address.clone(),
+            order_id: id,
+            market: self.markets[m].info.address.clone(),
             ts_ms: self.now,
             kind,
         });
@@ -409,13 +565,14 @@ impl World {
         let row = self.row("submitted", &o);
         self.journal.push(row);
         self.markets[o.market].acc.orders += 1;
-        self.orders.insert(o.id, o);
+        self.live.insert(o.id);
+        self.orders.insert(o);
     }
 
     /// The order reaches the book: checks, reservation, the crossing part, then the rest rests
     /// (GTC) or is cancelled (FAK).
     pub fn arrive(&mut self, id: OrderId) {
-        let Some(o) = self.orders.get(&id).cloned() else {
+        let Some(o) = self.orders.get(&id) else {
             return;
         };
         if o.state != OrderState::Pending {
@@ -445,12 +602,10 @@ impl World {
             o.rejected = true;
             o.done_ms = Some(self.now);
             o.end_reason = Some(reason.into());
-            let o = o.clone();
-            let mut row = self.row("rejected", &o);
-            row.reason = Some(reason.into());
-            self.journal.push(row);
+            self.live.remove(&id);
+            self.log("rejected", id, |r| r.reason = Some(reason.into()));
             self.update(
-                &o,
+                id,
                 OrderUpdateKind::Rejected {
                     reason: reason.into(),
                 },
@@ -474,10 +629,8 @@ impl World {
             o.state = OrderState::Live;
             o.arrived_ms = Some(self.now);
         }
-        let o = self.orders[&id].clone();
-        let row = self.row("accepted", &o);
-        self.journal.push(row);
-        self.update(&o, OrderUpdateKind::Accepted);
+        self.log("accepted", id, |_| {});
+        self.update(id, OrderUpdateKind::Accepted);
 
         self.take(id);
 
@@ -498,9 +651,9 @@ impl World {
     /// The crossing part of an arriving order: walk the opposite side from the best price while
     /// it is within the limit, taking what is visible and remembering it as eaten.
     fn take(&mut self, id: OrderId) {
-        let o = self.orders[&id].clone();
-        let m = o.market;
-        let opp = opposite(o.cside);
+        let o = &self.orders[&id];
+        let (m, cside, cticks, outcome) = (o.market, o.cside, o.cticks, o.outcome);
+        let opp = opposite(cside);
         // The CLOB never matches two orders of one maker: own resting orders the incoming one
         // reaches are cancelled.
         let own: Vec<OrderId> = self.markets[m]
@@ -509,21 +662,25 @@ impl World {
             .copied()
             .filter(|r| {
                 let r = &self.orders[r];
-                r.cside == opp && crosses(o.cside, o.cticks, r.cticks)
+                r.cside == opp && crosses(cside, cticks, r.cticks)
             })
             .collect();
         for r in own {
             self.finish(r, Some("self_trade"));
         }
-        let levels: Vec<(u32, u64)> = match o.cside {
+        let levels: Vec<(u32, u64)> = match cside {
             BookSide::Bid => self.markets[m].book[1]
-                .range(..=o.cticks)
-                .map(|(t, s)| (*t, *s))
+                .levels()
+                .iter()
+                .take_while(|l| l.0 <= cticks)
+                .copied()
                 .collect(),
             BookSide::Ask => self.markets[m].book[0]
-                .range(o.cticks..)
+                .levels()
+                .iter()
                 .rev()
-                .map(|(t, s)| (*t, *s))
+                .take_while(|l| l.0 >= cticks)
+                .copied()
                 .collect(),
         };
         for (t, size) in levels {
@@ -537,7 +694,7 @@ impl World {
             }
             let order = self.orders.get_mut(&id).expect("order exists");
             if order.taker_best.is_none() {
-                order.taker_best = Some(outcome_ticks(o.outcome, t));
+                order.taker_best = Some(outcome_ticks(outcome, t));
             }
             let qty = vis.min(rem);
             let e = self.markets[m].eaten.entry((opp, t)).or_insert(Eaten {
@@ -584,7 +741,7 @@ impl World {
                 self.acct.reserved_usdc -= release;
                 if !reverted {
                     self.acct.usdc -= value + fee;
-                    *self.acct.tokens.entry(key).or_default() += raw as i64;
+                    self.acct.add_tokens(key, raw as i64);
                     self.token_moves += 1;
                 }
             }
@@ -593,13 +750,14 @@ impl World {
                 o.reserved_tokens -= release;
                 *self.acct.reserved_tokens.entry(key).or_default() -= release;
                 if !reverted {
-                    *self.acct.tokens.entry(key).or_default() -= raw as i64;
+                    self.acct.add_tokens(key, -(raw as i64));
                     self.token_moves += 1;
                     self.acct.usdc += value - fee;
                 }
             }
         }
-        let side = o.side;
+        let (side, outcome) = (o.side, o.outcome);
+        let remaining = tokens(o.remaining());
         let done = o.remaining() == 0;
         let acc = &mut self.markets[m].acc;
         if reverted {
@@ -614,38 +772,34 @@ impl World {
             acc.fills += 1;
         }
 
-        let o = self.orders[&id].clone();
-        let mut row = self.row("fill", &o);
-        row.price = Some(tick_price(price));
-        row.quantity = Some(tokens(raw));
-        row.liquidity = Some(liquidity);
-        row.match_type = match_type;
-        row.fee = Some(usd(fee));
-        if reverted {
-            // the fill and its undoing: balances never moved
-            row.fee = Some(0.0);
-        }
-        self.journal.push(row);
+        self.log("fill", id, |row| {
+            row.price = Some(tick_price(price));
+            row.quantity = Some(tokens(raw));
+            row.liquidity = Some(liquidity);
+            row.match_type = match_type;
+            // a reverted fill and its undoing: balances never moved
+            row.fee = Some(if reverted { 0.0 } else { usd(fee) });
+        });
         self.update(
-            &o,
+            id,
             OrderUpdateKind::Filled {
-                outcome: o.outcome,
+                outcome,
                 side,
                 price: tick_price(price),
                 quantity: tokens(raw),
-                remaining: tokens(o.remaining()),
+                remaining,
                 liquidity,
                 match_type,
                 fee: if reverted { 0.0 } else { usd(fee) },
             },
         );
         if reverted {
-            let mut row = self.row("settlement_failed", &o);
-            row.price = Some(tick_price(price));
-            row.quantity = Some(tokens(raw));
-            self.journal.push(row);
+            self.log("settlement_failed", id, |row| {
+                row.price = Some(tick_price(price));
+                row.quantity = Some(tokens(raw));
+            });
             self.update(
-                &o,
+                id,
                 OrderUpdateKind::SettlementFailed {
                     price: tick_price(price),
                     quantity: tokens(raw),
@@ -679,16 +833,15 @@ impl World {
             o.end_reason = Some(r.into());
         }
         let m = o.market;
+        let remaining = tokens(o.remaining());
+        self.live.remove(&id);
         self.markets[m].resting.retain(|r| *r != id);
         if let Some(reason) = reason {
-            let o = self.orders[&id].clone();
-            let mut row = self.row("cancelled", &o);
-            row.reason = Some(reason.into());
-            self.journal.push(row);
+            self.log("cancelled", id, |row| row.reason = Some(reason.into()));
             self.update(
-                &o,
+                id,
                 OrderUpdateKind::Cancelled {
-                    remaining: tokens(o.remaining()),
+                    remaining,
                     reason: reason.into(),
                 },
             );
@@ -696,18 +849,18 @@ impl World {
     }
 
     pub fn cancel_requested(&mut self, id: OrderId) {
-        if let Some(o) = self.orders.get(&id).cloned() {
-            let row = self.row("cancel_requested", &o);
-            self.journal.push(row);
+        if self.orders.get(&id).is_some() {
+            self.log("cancel_requested", id, |_| {});
         }
     }
 
     /// A cancel reaches the book.
     pub fn cancel(&mut self, id: OrderId) {
-        let Some(o) = self.orders.get(&id).cloned() else {
+        let Some(o) = self.orders.get(&id) else {
             return;
         };
-        let failed = match o.state {
+        let state = o.state;
+        let failed = match state {
             OrderState::Live => {
                 self.finish(id, Some("cancelled"));
                 return;
@@ -716,11 +869,9 @@ impl World {
             OrderState::Pending => "unknown_order",
             OrderState::Done => "order_done",
         };
-        let mut row = self.row("cancel_failed", &o);
-        row.reason = Some(failed.into());
-        self.journal.push(row);
+        self.log("cancel_failed", id, |row| row.reason = Some(failed.into()));
         self.update(
-            &o,
+            id,
             OrderUpdateKind::CancelFailed {
                 reason: failed.into(),
             },
@@ -730,7 +881,8 @@ impl World {
     /// A recorded book snapshot or delta. Both outcomes' levels map onto the canonical ladder;
     /// where both carry the same level, up's wins.
     pub fn apply_book(&mut self, m: usize, levels: &[Level], snapshot: bool) {
-        let mut new: BTreeMap<(BookSide, u32), u64> = BTreeMap::new();
+        // Canonical levels, the last one of a key winning; down first so that up wins.
+        let mut new: Vec<((BookSide, u32), u64)> = Vec::with_capacity(levels.len());
         let ordered = levels
             .iter()
             .filter(|l| l.outcome != 0)
@@ -745,22 +897,26 @@ impl World {
             } else {
                 (opposite(l.side), TICKS - t)
             };
-            new.insert(key, l.size);
+            new.push((key, l.size));
         }
+        new.reverse();
+        new.sort_by_key(|l| l.0);
+        new.dedup_by_key(|l| l.0);
+
         let mkt = &mut self.markets[m];
         mkt.has_book = true;
         let mut changes: Vec<((BookSide, u32), u64, u64)> = Vec::new();
         if snapshot {
             for side in [BookSide::Bid, BookSide::Ask] {
-                for (&t, &old) in &mkt.book[idx(side)] {
-                    if !new.contains_key(&(side, t)) {
+                for &(t, old) in mkt.book[idx(side)].levels() {
+                    if new.binary_search_by_key(&(side, t), |l| l.0).is_err() {
                         changes.push(((side, t), old, 0));
                     }
                 }
             }
         }
-        for (&key, &size) in &new {
-            let old = mkt.book[idx(key.0)].get(&key.1).copied().unwrap_or(0);
+        for &(key, size) in &new {
+            let old = mkt.book[idx(key.0)].get(key.1);
             changes.push((key, old, size));
         }
         for (key, old, size) in changes {
@@ -773,11 +929,7 @@ impl World {
         let now = self.now;
         let model = self.params.queue_model;
         let mkt = &mut self.markets[m];
-        if new == 0 {
-            mkt.book[idx(key.0)].remove(&key.1);
-        } else {
-            mkt.book[idx(key.0)].insert(key.1, new);
-        }
+        mkt.book[idx(key.0)].set(key.1, new);
         // Eaten liquidity: new orders on the level (it grew) bring it back; when it shrinks, the
         // part we took stays taken as far as the level still holds it.
         if let Some(e) = mkt.eaten.get_mut(&key) {
@@ -821,8 +973,8 @@ impl World {
         }
         let cancels = drop;
         let base = old - explained;
-        for id in mkt.resting.clone() {
-            let o = self.orders.get_mut(&id).expect("resting order exists");
+        for id in &mkt.resting {
+            let o = self.orders.get_mut(id).expect("resting order exists");
             if (o.cside, o.cticks) != key {
                 continue;
             }
@@ -837,6 +989,9 @@ impl World {
 
     /// Resting orders the book now trades through fill completely at their own price.
     fn cross_resting(&mut self, m: usize) {
+        if self.markets[m].resting.is_empty() {
+            return;
+        }
         let best_bid = self.markets[m].best_visible(BookSide::Bid);
         let best_ask = self.markets[m].best_visible(BookSide::Ask);
         for id in self.markets[m].resting.clone() {
@@ -937,7 +1092,7 @@ impl World {
                 (0, 0)
             };
             let pay = gross - fee;
-            self.acct.tokens.insert((m, o), 0);
+            self.acct.tokens.remove(&(m, o));
             self.token_moves += 1;
             self.acct.usdc += pay;
             let acc = &mut self.markets[m].acc;

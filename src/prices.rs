@@ -33,7 +33,8 @@ pub struct PriceTick {
 pub(crate) fn read_ticks(feed: &str, file: Bytes) -> Result<Vec<PriceTick>> {
     let what = "price file";
     let mut out = Vec::new();
-    for b in pq::read_batches(file, what)? {
+    let columns = ["publish_time", "receive_time", "price", "conf", "slot"];
+    for b in pq::read_columns(file, what, &columns)? {
         let publish = pq::ts(&b, "publish_time", what)?;
         let receive = pq::ts(&b, "receive_time", what)?;
         let price = pq::f64s(&b, "price", what)?;
@@ -57,7 +58,9 @@ pub(crate) fn read_ticks(feed: &str, file: Bytes) -> Result<Vec<PriceTick>> {
             });
         }
     }
-    out.sort_by_key(|t| (t.receive_ms, t.publish_ms));
+    if !out.is_sorted_by_key(|t| (t.receive_ms, t.publish_ms)) {
+        out.sort_by_key(|t| (t.receive_ms, t.publish_ms));
+    }
     Ok(out)
 }
 

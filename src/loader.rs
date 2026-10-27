@@ -25,7 +25,7 @@ use crate::trades::{
 const MARKETS_PER_QUERY: usize = 50;
 const TRADE_BATCH_MARKETS: usize = 40;
 const TRADE_BATCH_SPAN: i64 = 2 * 86_400;
-const FILE_DOWNLOADS: usize = 8;
+const FILE_DOWNLOADS: usize = 16;
 /// Trades older than this are surely indexed by the API.
 const TRADES_SETTLED: Duration = Duration::minutes(10);
 /// A book file appears within ~26 h after a market ends; after this its absence is final.
@@ -296,44 +296,54 @@ impl Loader {
     pub async fn load(&self, req: &Request) -> Result<Dataset> {
         let ep = req.endpoints()?;
         let cache = self.cache(req, &ep);
-        let (catalog, mut fill_files) = self.catalog_with_fills(req, &ep, &cache).await?;
+        let (catalog, fill_files) = self.catalog_with_fills(req, &ep, &cache).await?;
         let mut warnings = catalog.warnings;
         let now = self.now();
+        let selected = &catalog.markets;
 
-        let mut fills = HashMap::new();
-        if req.data.fills {
-            for m in &catalog.markets {
-                let Some(file) = fill_files.remove(&m.address) else {
-                    continue;
-                };
-                let (f, unknown) = read_fills(m, file)?;
-                if unknown > 0 {
-                    warnings.push(format!(
-                        "fills {}: {unknown} fill(s) of unknown tokens (no outcome index)",
-                        m.address
-                    ));
-                }
-                fills.insert(m.address.clone(), f);
+        // The sources are independent: load them at the same time.
+        let fills = async {
+            if req.data.fills {
+                parse_fills(selected, fill_files).await
+            } else {
+                Ok((HashMap::new(), Vec::new()))
             }
-        }
+        };
+        let trades = async {
+            if req.data.trades {
+                self.load_trades(&ep, &cache, selected, now).await
+            } else {
+                Ok(HashMap::new())
+            }
+        };
+        let books = async {
+            let mut w = Vec::new();
+            let books = if req.data.book {
+                self.load_books(&ep, &cache, selected, now, &mut w).await?
+            } else {
+                HashMap::new()
+            };
+            Ok::<_, Error>((books, w))
+        };
+        let prices = async {
+            let mut w = Vec::new();
+            let prices = if req.data.prices {
+                self.load_prices(&ep, &cache, req, selected, now, &mut w)
+                    .await?
+            } else {
+                BTreeMap::new()
+            };
+            Ok::<_, Error>((prices, w))
+        };
+        let (fills, trades, books, prices) = tokio::join!(fills, trades, books, prices);
+        let (mut fills, w) = fills?;
+        warnings.extend(w);
+        let mut trades = trades?;
+        let (mut books, w) = books?;
+        warnings.extend(w);
+        let (prices, w) = prices?;
+        warnings.extend(w);
 
-        let mut trades = if req.data.trades {
-            self.load_trades(&ep, &cache, &catalog.markets, now).await?
-        } else {
-            HashMap::new()
-        };
-        let mut books = if req.data.book {
-            self.load_books(&ep, &cache, &catalog.markets, now, &mut warnings)
-                .await?
-        } else {
-            HashMap::new()
-        };
-        let prices = if req.data.prices {
-            self.load_prices(&ep, &cache, req, &catalog.markets, now, &mut warnings)
-                .await?
-        } else {
-            BTreeMap::new()
-        };
         let markets = catalog
             .markets
             .into_iter()
@@ -448,40 +458,48 @@ impl Loader {
                 todo.push(m);
             }
         }
-        let results: Vec<Result<(&MarketInfo, Option<bytes::Bytes>)>> = stream::iter(todo)
+        type Parsed<'m> = Result<(&'m MarketInfo, Option<(BookHistory, usize)>)>;
+        let results: Vec<Parsed> = stream::iter(todo)
             .map(|m| async move {
                 let path = cache.book_path(&m.book_path());
-                if let Some(b) = cache.read(&path)? {
-                    return Ok((m, Some(b)));
-                }
-                if cache.is_missing(&path) {
+                let file = if let Some(b) = cache.read(&path)? {
+                    b
+                } else if cache.is_missing(&path) {
                     return Ok((m, None));
-                }
-                let url = format!("{}/books/{}", ep.data_url, m.book_path());
-                match self.http.data_file(&url).await? {
-                    Some(b) => {
-                        cache.write(&path, &b)?;
-                        Ok((m, Some(b)))
-                    }
-                    None => {
-                        if now - m.end > BOOK_FINAL_AFTER {
-                            cache.mark_missing(&path)?;
+                } else {
+                    let url = format!("{}/books/{}", ep.data_url, m.book_path());
+                    match self.http.data_file(&url).await? {
+                        Some(b) => {
+                            cache.write(&path, &b)?;
+                            b
                         }
-                        Ok((m, None))
+                        None => {
+                            if now - m.end > BOOK_FINAL_AFTER {
+                                cache.mark_missing(&path)?;
+                            }
+                            return Ok((m, None));
+                        }
                     }
-                }
+                };
+                // Decoding is CPU work: off the async threads, several files at once.
+                let info = m.clone();
+                let parsed = blocking(move || -> Result<_> {
+                    let rows = read_rows(&info, file)?;
+                    Ok(BookHistory::from_rows(&info, rows))
+                })
+                .await?;
+                Ok((m, Some(parsed)))
             })
             .buffer_unordered(FILE_DOWNLOADS)
             .collect()
             .await;
         let mut out = HashMap::new();
         for r in results {
-            let (m, file) = r?;
-            let Some(file) = file else {
+            let (m, parsed) = r?;
+            let Some((h, skipped)) = parsed else {
                 absent.push(m.address.clone());
                 continue;
             };
-            let (h, skipped) = BookHistory::from_rows(m, read_rows(file)?);
             if skipped > 0 {
                 warnings.push(format!(
                     "book {}: {skipped} row(s) of unknown tokens skipped",
@@ -603,24 +621,31 @@ impl Loader {
                 todo.push((feed, day));
             }
         }
-        let results: Vec<Result<(String, NaiveDate, Option<bytes::Bytes>)>> = stream::iter(todo)
+        type Parsed = Result<(String, NaiveDate, Option<Vec<PriceTick>>)>;
+        let results: Vec<Parsed> = stream::iter(todo)
             .map(|(feed, day)| async move {
                 let day_s = day.format("%Y-%m-%d").to_string();
                 let path = cache.price_path(&feed, &day_s);
-                if let Some(b) = cache.read(&path)? {
-                    return Ok((feed, day, Some(b)));
-                }
-                if cache.is_missing(&path) {
+                let file = if let Some(b) = cache.read(&path)? {
+                    Some(b)
+                } else if cache.is_missing(&path) {
+                    None
+                } else {
+                    let url = format!("{}/prices/pyth/{feed}/{day_s}.parquet", ep.data_url);
+                    let file = self.http.data_file(&url).await?;
+                    match &file {
+                        Some(b) => cache.write(&path, b)?,
+                        None if !day_published(day + Duration::days(1), now) => {}
+                        None => cache.mark_missing(&path)?,
+                    }
+                    file
+                };
+                let Some(file) = file else {
                     return Ok((feed, day, None));
-                }
-                let url = format!("{}/prices/pyth/{feed}/{day_s}.parquet", ep.data_url);
-                let file = self.http.data_file(&url).await?;
-                match &file {
-                    Some(b) => cache.write(&path, b)?,
-                    None if !day_published(day + Duration::days(1), now) => {}
-                    None => cache.mark_missing(&path)?,
-                }
-                Ok((feed, day, file))
+                };
+                let name = feed.clone();
+                let ticks = blocking(move || read_ticks(&name, file)).await?;
+                Ok((feed, day, Some(ticks)))
             })
             .buffer_unordered(FILE_DOWNLOADS)
             .collect()
@@ -628,12 +653,9 @@ impl Loader {
         let mut out: BTreeMap<String, Vec<PriceTick>> = BTreeMap::new();
         let mut absent = Vec::new();
         for r in results {
-            let (feed, day, file) = r?;
-            match file {
-                Some(b) => out
-                    .entry(feed.clone())
-                    .or_default()
-                    .extend(read_ticks(&feed, b)?),
+            let (feed, day, ticks) = r?;
+            match ticks {
+                Some(t) => out.entry(feed).or_default().extend(t),
                 None => absent.push(format!("{feed} {day}")),
             }
         }
@@ -660,6 +682,48 @@ impl Loader {
         }
         Ok(out)
     }
+}
+
+/// Runs CPU work on tokio's blocking threads; a panic there goes on here.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => v,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
+/// Decodes the fills files of `markets`, several at once; warnings in market order.
+async fn parse_fills(
+    markets: &[MarketInfo],
+    mut files: HashMap<String, bytes::Bytes>,
+) -> Result<(HashMap<String, Vec<Fill>>, Vec<String>)> {
+    let jobs: Vec<(MarketInfo, bytes::Bytes)> = markets
+        .iter()
+        .filter_map(|m| files.remove(&m.address).map(|f| (m.clone(), f)))
+        .collect();
+    let parsed: Vec<Result<(MarketInfo, Vec<Fill>, usize)>> = stream::iter(jobs)
+        .map(|(m, file)| {
+            blocking(move || {
+                let (f, unknown) = read_fills(&m, file)?;
+                Ok((m, f, unknown))
+            })
+        })
+        .buffered(FILE_DOWNLOADS)
+        .collect()
+        .await;
+    let mut out = HashMap::new();
+    let mut warnings = Vec::new();
+    for r in parsed {
+        let (m, f, unknown) = r?;
+        if unknown > 0 {
+            warnings.push(format!(
+                "fills {}: {unknown} fill(s) of unknown tokens (no outcome index)",
+                m.address
+            ));
+        }
+        out.insert(m.address, f);
+    }
+    Ok((out, warnings))
 }
 
 fn convert(page: Vec<ApiMarket>) -> Result<Vec<MarketInfo>> {

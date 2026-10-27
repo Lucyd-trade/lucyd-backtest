@@ -334,7 +334,11 @@ fn metrics(
     start_equity: i64,
     initial: i64,
 ) -> Metrics {
-    let in_set = |m: usize| markets.contains(&m);
+    let mut set = vec![false; w.markets.len()];
+    for &m in markets {
+        set[m] = true;
+    }
+    let in_set = |m: usize| set[m];
     let mut pnl = 0i64;
     let (mut traded, mut won, mut fills, mut reverted) = (0u32, 0u32, 0u32, 0u32);
     let (mut turnover, mut fees) = (0i64, 0i64);
@@ -443,12 +447,14 @@ fn sample_metrics(
 
 pub(crate) fn build(
     data: &Dataset,
-    w: &World,
+    mut world: World,
     equity: &[Sample],
     strategy: String,
     from_ms: i64,
     to_ms: i64,
 ) -> Report {
+    let journal = std::mem::take(&mut world.journal);
+    let w = &world;
     let initial = (w.params.initial_usdc * 1e6).round() as i64;
     let all: Vec<usize> = (0..w.markets.len()).collect();
     let f = w.params.validation_fraction;
@@ -514,7 +520,7 @@ pub(crate) fn build(
         }
     });
 
-    let avg = avg_prices(&w.journal);
+    let avg = avg_prices(&journal);
     let orders = w
         .orders
         .values()
@@ -593,7 +599,7 @@ pub(crate) fn build(
         markets,
         equity: curve(equity),
         orders,
-        journal: w.journal.clone(),
+        journal,
         warnings,
     }
 }

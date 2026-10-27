@@ -5,6 +5,7 @@ use arrow_array::{
     UInt64Array,
 };
 use bytes::Bytes;
+use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::error::{Result, bad};
@@ -12,6 +13,17 @@ use crate::error::{Result, bad};
 pub(crate) fn read_batches(file: Bytes, what: &str) -> Result<Vec<RecordBatch>> {
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
     reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| bad(what, e.to_string()))
+}
+
+/// Like [`read_batches`], decoding only `columns`; a column the file lacks is simply absent.
+pub(crate) fn read_columns(file: Bytes, what: &str, columns: &[&str]) -> Result<Vec<RecordBatch>> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let mask = ProjectionMask::columns(builder.parquet_schema(), columns.iter().copied());
+    builder
+        .with_projection(mask)
+        .build()?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| bad(what, e.to_string()))
 }

@@ -79,10 +79,17 @@ pub struct MarketInfo {
 impl MarketInfo {
     /// Outcome index of a token id, if it belongs to this market.
     pub fn outcome_of(&self, asset_id: &str) -> Option<u8> {
-        let a = asset_id.to_ascii_lowercase();
+        // ids are kept lowercase; compare without allocating (called for every book row)
+        let same = |id: &str| {
+            id.len() == asset_id.len()
+                && id
+                    .bytes()
+                    .zip(asset_id.bytes())
+                    .all(|(x, y)| x == y.to_ascii_lowercase())
+        };
         self.outcome_ids
             .iter()
-            .position(|id| *id == a)
+            .position(|id| same(id))
             .map(|i| i as u8)
     }
 

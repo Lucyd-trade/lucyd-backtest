@@ -27,10 +27,12 @@ mod world;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::rc::Rc;
 
 use crate::error::Result;
-use crate::event::EventKind;
+use crate::event::{Ev, Stream};
 use crate::loader::Dataset;
 
 pub use params::{ExecParams, QueueModel};
@@ -47,7 +49,7 @@ pub use world::JournalRow;
 use strategy::Action;
 use world::World;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Job {
     Arrive(OrderId),
     Cancel(OrderId),
@@ -66,9 +68,13 @@ impl Job {
 
 struct Engine {
     world: World,
-    /// Scheduled jobs by (time, order of scheduling).
-    jobs: BTreeMap<(i64, u64), Job>,
+    /// Market addresses, cheap to hand to handlers.
+    addrs: Vec<Rc<str>>,
+    /// Scheduled jobs by (time, order of scheduling), earliest first.
+    jobs: BinaryHeap<Reverse<(i64, u64, Job)>>,
     job_seq: u64,
+    /// Buffer for the actions of a handler.
+    actions: Vec<Action>,
     next_id: OrderId,
     subs: Subscriptions,
     book_sent: Vec<Option<i64>>,
@@ -88,25 +94,31 @@ pub fn run<S: Strategy + ?Sized>(
     strategy: &mut S,
 ) -> Result<Report> {
     params.validate()?;
-    let events = data.events();
+    let stream = Stream::new(data);
     let start_ms = data
         .request
         .from
         .map(|t| t.timestamp_millis())
-        .or(events.first().map(|e| e.ts_ms))
+        .or(stream.order.first().map(|e| e.0.ts_ms))
         .unwrap_or(0);
     let end_ms = data
         .request
         .to
         .map(|t| t.timestamp_millis())
-        .or(events.last().map(|e| e.ts_ms))
+        .or(stream.order.last().map(|e| e.0.ts_ms))
         .unwrap_or(start_ms);
     let infos = data.markets.iter().map(|m| m.info.clone()).collect();
     let n = data.markets.len();
     let mut e = Engine {
         world: World::new(infos, params.clone()),
-        jobs: BTreeMap::new(),
+        addrs: data
+            .markets
+            .iter()
+            .map(|m| Rc::from(m.info.address.as_str()))
+            .collect(),
+        jobs: BinaryHeap::new(),
         job_seq: 0,
+        actions: Vec::new(),
         next_id: 0,
         subs: strategy.subscriptions(),
         book_sent: vec![None; n],
@@ -116,87 +128,77 @@ pub fn run<S: Strategy + ?Sized>(
         start_ms,
         end_ms,
     };
-    e.world.now = start_ms;
+    e.world.set_now(start_ms);
     e.call(strategy, |s, c| s.on_start(c));
     if let Some(t) = e.subs.timer_ms.filter(|t| *t > 0) {
         e.schedule(start_ms + t as i64, Job::Timer);
     }
     e.schedule(start_ms, Job::Equity);
 
-    for ev in &events {
-        e.drain(strategy, ev.ts_ms, false);
-        e.world.now = ev.ts_ms;
-        let m = ev
-            .market
-            .as_deref()
-            .and_then(|a| e.world.index.get(a).copied());
-        match (&ev.kind, m) {
-            (EventKind::MarketOpen { .. }, Some(m)) => {
-                let addr = e.world.markets[m].info.address.clone();
+    for &(key, src) in &stream.order {
+        let ts_ms = key.ts_ms;
+        e.drain(strategy, ts_ms, false);
+        e.world.set_now(ts_ms);
+        match stream.get(src) {
+            Ev::MarketOpen(m) => {
+                let addr = e.addrs[m].clone();
                 e.call(strategy, |s, c| s.on_market_open(c, &addr));
             }
-            (
-                EventKind::PriceTick {
-                    feed,
-                    price,
-                    conf,
-                    publish_ms,
-                },
-                _,
-            ) => {
+            Ev::PriceTick(feed, t) => {
                 let p = PriceView {
-                    price: *price,
-                    conf: *conf,
-                    publish_ms: *publish_ms,
-                    ts_ms: ev.ts_ms,
+                    price: t.price,
+                    conf: t.conf,
+                    publish_ms: t.publish_ms,
+                    ts_ms,
                 };
-                e.world.price_tick(feed, p.clone());
                 if e.subs.prices {
+                    e.world.price_tick(feed, p.clone());
                     e.call(strategy, |s, c| s.on_price(c, feed, &p));
+                } else {
+                    e.world.price_tick(feed, p);
                 }
             }
-            (EventKind::BookSnapshot { levels, .. }, Some(m)) => {
-                e.world.apply_book(m, levels, true);
-                e.world.markets[m].record_mark(ev.ts_ms, false);
+            Ev::Book {
+                market: m,
+                levels,
+                snapshot,
+                ..
+            } => {
+                e.world.apply_book(m, levels, snapshot);
+                e.world.markets[m].record_mark(ts_ms, false);
                 e.flush(strategy);
                 e.book_changed(strategy, m);
             }
-            (EventKind::BookDelta { changes }, Some(m)) => {
-                e.world.apply_book(m, changes, false);
-                e.world.markets[m].record_mark(ev.ts_ms, false);
-                e.flush(strategy);
-                e.book_changed(strategy, m);
-            }
-            (EventKind::Fill { fill }, Some(m)) => {
+            Ev::Fill(m, fill) => {
                 e.world.recorded_fill(m, fill);
-                e.world.markets[m].record_mark(ev.ts_ms, false);
+                e.world.markets[m].record_mark(ts_ms, false);
                 e.flush(strategy);
                 if e.subs.fills {
                     e.call(strategy, |s, c| s.on_fill(c, fill));
                 }
             }
-            (EventKind::MarketClose { .. }, Some(m)) => {
-                e.world.markets[m].record_mark(ev.ts_ms, true);
+            Ev::MarketClose(m) => {
+                e.world.markets[m].record_mark(ts_ms, true);
                 e.world.close(m);
                 e.flush(strategy);
-                let addr = e.world.markets[m].info.address.clone();
+                let addr = e.addrs[m].clone();
                 e.call(strategy, |s, c| s.on_market_close(c, &addr));
                 let info = &data.markets[m].info;
                 if info.voided || info.winner.is_some() {
                     let at = info
                         .resolved_at
-                        .map_or(ev.ts_ms, |t| t.timestamp_millis())
-                        .max(ev.ts_ms);
+                        .map_or(ts_ms, |t| t.timestamp_millis())
+                        .max(ts_ms);
                     e.schedule(at, Job::Resolve(m));
                 }
             }
             // On-chain trades are a separate, late source; execution uses fills.
-            _ => {}
+            Ev::Trade(..) => {}
         }
         e.check_held();
     }
     e.drain(strategy, i64::MAX, true);
-    e.world.now = e.world.now.max(end_ms);
+    e.world.set_now(end_ms);
     e.call(strategy, |s, c| s.on_finish(c));
     e.flush(strategy);
     e.check_held();
@@ -204,34 +206,30 @@ pub fn run<S: Strategy + ?Sized>(
     if e.equity.last().is_none_or(|p| p.0 < last.0) {
         e.equity.push(last);
     }
+    let name = strategy.name();
     Ok(report::build(
-        data,
-        &e.world,
-        &e.equity,
-        strategy.name(),
-        e.start_ms,
-        e.end_ms,
+        data, e.world, &e.equity, name, e.start_ms, e.end_ms,
     ))
 }
 
 impl Engine {
     fn schedule(&mut self, ts: i64, job: Job) {
         self.job_seq += 1;
-        self.jobs.insert((ts, self.job_seq), job);
+        self.jobs.push(Reverse((ts, self.job_seq, job)));
     }
 
     /// Runs every job due at or before `until`. With `last`, periodic jobs past the end of the
     /// data are dropped.
     fn drain<S: Strategy + ?Sized>(&mut self, s: &mut S, until: i64, last: bool) {
-        while let Some((&(ts, seq), &job)) = self.jobs.first_key_value() {
+        while let Some(&Reverse((ts, _, job))) = self.jobs.peek() {
             if ts > until {
                 break;
             }
-            self.jobs.remove(&(ts, seq));
+            self.jobs.pop();
             if last && job.periodic() && ts > self.end_ms {
                 continue;
             }
-            self.world.now = self.world.now.max(ts);
+            self.world.set_now(ts);
             self.job(s, job);
             self.check_held();
         }
@@ -290,7 +288,7 @@ impl Engine {
                     voided: info.voided,
                     resolved_price: info.resolved_price,
                 };
-                let addr = info.address.clone();
+                let addr = self.addrs[m].clone();
                 self.world.resolve(m, r.clone());
                 self.call(s, |s, c| s.on_resolution(c, &addr, &r));
             }
@@ -329,7 +327,7 @@ impl Engine {
 
     fn send_book<S: Strategy + ?Sized>(&mut self, s: &mut S, m: usize) {
         self.book_sent[m] = Some(self.world.now);
-        let addr = self.world.markets[m].info.address.clone();
+        let addr = self.addrs[m].clone();
         self.call(s, |s, c| s.on_book(c, &addr));
     }
 
@@ -344,7 +342,7 @@ impl Engine {
 
     /// Calls a handler, then sends what it decided.
     fn call<S: Strategy + ?Sized>(&mut self, s: &mut S, f: impl FnOnce(&mut S, &mut Ctx)) {
-        let mut actions = Vec::new();
+        let mut actions = std::mem::take(&mut self.actions);
         {
             let mut ctx = Ctx {
                 world: &self.world,
@@ -354,7 +352,7 @@ impl Engine {
             f(s, &mut ctx);
         }
         let now = self.world.now;
-        for a in actions {
+        for a in actions.drain(..) {
             let jitter = self.world.params.latency_jitter_ms;
             match a {
                 Action::Submit(o) => {
@@ -370,5 +368,6 @@ impl Engine {
                 }
             }
         }
+        self.actions = actions;
     }
 }
