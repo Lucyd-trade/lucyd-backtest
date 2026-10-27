@@ -1,8 +1,9 @@
-//! Data loader for backtests on [Lucyd](https://testnet.lucyd.trade) prediction markets.
+//! Data loader and execution engine for backtests on [Lucyd](https://testnet.lucyd.trade) prediction markets.
 //!
 //! Build a [`Request`], hand it to a [`Loader`] and get a [`Dataset`]: the market catalog, the
 //! order book history, CLOB fills, on-chain trades and Pyth prices of every selected market, one
-//! time-ordered [`Event`] stream, and the full book at any moment.
+//! time-ordered [`Event`] stream, and the full book at any moment. [`engine::run`] replays it to a
+//! strategy and reports what its orders would have done (`docs/execution.md`).
 //!
 //! ```no_run
 //! use lucyd_backtest::{DataKinds, Loader, Period, Request, parse_time};
@@ -23,6 +24,7 @@
 
 mod book;
 mod cache;
+pub mod engine;
 mod error;
 mod event;
 pub mod export;

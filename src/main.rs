@@ -1,12 +1,20 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
-use lucyd_backtest::export::{Format, export};
-use lucyd_backtest::{DataKinds, Loader, MarketInfo, Request, default_cache_dir, parse_time};
+#[path = "../examples/strategies/ladder_mm.rs"]
+mod ladder_mm;
+#[path = "../examples/strategies/late_side.rs"]
+mod late_side;
 
-/// Lucyd backtest data: select markets, download their order book, CLOB fills, on-chain trades
-/// and prices, export the event stream.
+use clap::{Args, Parser, Subcommand};
+use lucyd_backtest::engine::{ExecParams, Metrics, QueueModel, Report, Strategy, write_journal};
+use lucyd_backtest::export::{Format, export};
+use lucyd_backtest::{
+    DataKinds, Error, Loader, MarketInfo, Request, default_cache_dir, parse_time,
+};
+
+/// Lucyd backtests: select markets, download their order book, CLOB fills, on-chain trades and
+/// prices, export the event stream, run a strategy.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -15,6 +23,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once
 enum Cmd {
     /// Show the markets a request selects.
     List {
@@ -40,6 +49,163 @@ enum Cmd {
         #[arg(long)]
         format: Option<String>,
     },
+    /// Run an example strategy over the selected markets and print its report.
+    Run {
+        #[command(flatten)]
+        req: RequestArgs,
+        /// late-side or ladder-mm (examples/strategies).
+        #[arg(long)]
+        strategy: String,
+        /// Strategy settings as JSON, e.g. '{"seconds_before": 60}'.
+        #[arg(long)]
+        config: Option<String>,
+        #[command(flatten)]
+        exec: ExecArgs,
+        /// Write the full report as JSON.
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Write the own-order journal (.csv or .parquet).
+        #[arg(long)]
+        journal: Option<PathBuf>,
+    },
+}
+
+#[derive(Args)]
+struct ExecArgs {
+    /// Execution parameters as a JSON file (engine `ExecParams`). Flags below override it.
+    #[arg(long)]
+    params: Option<PathBuf>,
+    /// Starting USDC.
+    #[arg(long)]
+    initial_usdc: Option<f64>,
+    /// Order latency, ms.
+    #[arg(long)]
+    latency_ms: Option<u64>,
+    /// Cancel latency, ms.
+    #[arg(long)]
+    cancel_latency_ms: Option<u64>,
+    /// Random extra latency up to this, ms.
+    #[arg(long)]
+    jitter_ms: Option<u64>,
+    /// pessimistic or proportional.
+    #[arg(long)]
+    queue_model: Option<String>,
+    /// Trading fee, basis points.
+    #[arg(long)]
+    fee_bps: Option<u32>,
+    /// Chance that an own fill's settlement fails.
+    #[arg(long)]
+    revert_probability: Option<f64>,
+    /// Last share of the range for validation, 0 = none.
+    #[arg(long)]
+    validation_fraction: Option<f64>,
+    #[arg(long)]
+    seed: Option<u64>,
+}
+
+impl ExecArgs {
+    fn build(&self) -> lucyd_backtest::Result<ExecParams> {
+        let mut p = match &self.params {
+            Some(path) => serde_json::from_str(&std::fs::read_to_string(path)?)
+                .map_err(|e| Error::InvalidRequest(format!("{}: {e}", path.display())))?,
+            None => ExecParams::default(),
+        };
+        if let Some(v) = self.initial_usdc {
+            p.initial_usdc = v;
+        }
+        if let Some(v) = self.latency_ms {
+            p.submit_latency_ms = v;
+        }
+        if let Some(v) = self.cancel_latency_ms {
+            p.cancel_latency_ms = v;
+        }
+        if let Some(v) = self.jitter_ms {
+            p.latency_jitter_ms = v;
+        }
+        if let Some(v) = &self.queue_model {
+            p.queue_model = match v.as_str() {
+                "pessimistic" => QueueModel::Pessimistic,
+                "proportional" => QueueModel::Proportional,
+                _ => {
+                    return Err(Error::InvalidRequest(format!(
+                        "queue model {v:?}: pessimistic or proportional"
+                    )));
+                }
+            };
+        }
+        if let Some(v) = self.fee_bps {
+            p.fee_bps = v;
+        }
+        if let Some(v) = self.revert_probability {
+            p.revert_probability = v;
+        }
+        if let Some(v) = self.validation_fraction {
+            p.validation_fraction = v;
+        }
+        if let Some(v) = self.seed {
+            p.seed = v;
+        }
+        Ok(p)
+    }
+}
+
+fn strategy(name: &str, config: Option<&str>) -> lucyd_backtest::Result<Box<dyn Strategy>> {
+    fn cfg<T: serde::de::DeserializeOwned + Default>(c: Option<&str>) -> lucyd_backtest::Result<T> {
+        c.map_or(Ok(T::default()), |c| {
+            serde_json::from_str(c).map_err(|e| Error::InvalidRequest(format!("--config: {e}")))
+        })
+    }
+    Ok(match name {
+        "late-side" | "late_side" => Box::new(late_side::LateSide::new(cfg(config)?)),
+        "ladder-mm" | "ladder_mm" => Box::new(ladder_mm::LadderMm::new(cfg(config)?)),
+        _ => {
+            return Err(Error::InvalidRequest(format!(
+                "strategy {name:?}: late-side or ladder-mm"
+            )));
+        }
+    })
+}
+
+fn opt(v: Option<f64>, f: impl Fn(f64) -> String) -> String {
+    v.map(f).unwrap_or_else(|| "-".into())
+}
+
+fn print_metrics(title: &str, m: &Metrics) {
+    println!("{title}");
+    println!(
+        "  P&L {:+.2} USDC ({:+.2}%), equity {:.2} -> {:.2}, max drawdown {:.2} ({:.2}%)",
+        m.pnl, m.return_pct, m.start_equity, m.end_equity, m.max_drawdown, m.max_drawdown_pct
+    );
+    println!(
+        "  markets traded {}, won {}, win rate {}",
+        m.markets_traded,
+        m.markets_won,
+        opt(m.win_rate, |v| format!("{:.1}%", v * 100.0))
+    );
+    println!(
+        "  orders {} (rejected {}), fills {} (reverted {}), turnover {:.2}, fees {:.2}",
+        m.orders, m.rejected_orders, m.fills, m.reverted_fills, m.turnover, m.fees
+    );
+    println!(
+        "  taker orders {}, avg slippage {}; limit orders {}, filled {} ({})",
+        m.taker_orders,
+        opt(m.avg_slippage, |v| format!("{v:.4}")),
+        m.limit_orders,
+        m.limit_orders_filled,
+        opt(m.limit_fill_rate, |v| format!("{:.1}%", v * 100.0))
+    );
+}
+
+fn print_report(r: &Report) {
+    print_metrics(&format!("{}: whole range", r.strategy), &r.summary);
+    if let Some(p) = &r.periods {
+        let split = lucyd_backtest::chrono::DateTime::from_timestamp_millis(p.split_ms)
+            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        print_metrics(&format!("fit (markets ending by {split})"), &p.fit);
+        print_metrics("validation", &p.validation);
+    }
+    warn(&r.warnings);
 }
 
 #[derive(Args)]
@@ -267,6 +433,32 @@ async fn run(cli: Cli) -> lucyd_backtest::Result<()> {
                 out.display()
             );
             warn(&ds.warnings);
+        }
+        Cmd::Run {
+            req,
+            strategy: name,
+            config,
+            exec,
+            report,
+            journal,
+        } => {
+            let params = exec.build()?;
+            let mut s = strategy(&name, config.as_deref())?;
+            let r = req.build(DataKinds::DEFAULT)?;
+            let ds = req.loader()?.load(&r).await?;
+            let rep = lucyd_backtest::engine::run(&ds, &params, s.as_mut())?;
+            print_report(&rep);
+            if let Some(path) = report {
+                rep.write_json(&path)?;
+                println!("report -> {}", path.display());
+            }
+            if let Some(path) = journal {
+                let fmt = Format::from_path(&path).ok_or_else(|| {
+                    Error::InvalidRequest("journal must end in .csv or .parquet".into())
+                })?;
+                let n = write_journal(&rep.journal, &path, fmt)?;
+                println!("{n} journal row(s) -> {}", path.display());
+            }
         }
     }
     Ok(())

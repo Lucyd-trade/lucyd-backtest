@@ -1,6 +1,6 @@
 # lucyd-backtest
 
-Backtesting toolkit for [Lucyd](https://testnet.lucyd.trade) prediction markets. This first part is the data loader: pick markets by series and time range, download their L2 order book history, order book fills, on-chain trades and Pyth prices, and get them as one time-ordered event stream, with the full order book at any moment. The execution engine and MCP tools for AI agents will be built on top of it.
+Backtesting toolkit for [Lucyd](https://testnet.lucyd.trade) prediction markets. Two parts: a data loader (pick markets by series and time range, download their L2 order book history, order book fills, on-chain trades and Pyth prices, and get them as one time-ordered event stream, with the full order book at any moment) and an execution engine that runs a strategy over that data with latency, slippage and queue position, keeps the account and reports P&L. MCP tools for AI agents will be built on top of it.
 
 > Lucyd currently runs on the Ethereum Sepolia testnet with test USDC. Most of the testnet liquidity comes from the platform's own market maker, plus a small stream of test trades, so books and fills are not those of a live market with independent traders. Use the data to build and test strategies and tooling, not to estimate real-money returns.
 
@@ -83,6 +83,82 @@ lucyd-backtest export --request request.json -o events.csv
 ```
 
 `list` has a `fills` column (`yes` / `no`; `-` when fills are not asked for, e.g. `--data book`) and the count of markets with fills in the total line. `list --json` prints the catalog as JSON. Warnings (missing files, days without prices) go to stderr.
+
+## Backtest a strategy
+
+A strategy is a Rust type implementing `engine::Strategy`. Every handler has an empty default; implement the ones you need. Each handler gets a context (`Ctx`) with the state as of now (nothing later) and places orders through it.
+
+```rust
+use lucyd_backtest::Side;
+use lucyd_backtest::engine::{Ctx, ExecParams, OrderUpdate, Strategy, Subscriptions, run};
+
+struct BuyCheapUp;
+
+impl Strategy for BuyCheapUp {
+    fn subscriptions(&self) -> Subscriptions {
+        Subscriptions { timer_ms: Some(1000), ..Subscriptions::default() }
+    }
+
+    fn on_timer(&mut self, ctx: &mut Ctx) {
+        for m in ctx.open_markets() {
+            let cheap = ctx.best_ask(&m.address, 0).is_some_and(|a| a.price <= 0.3);
+            if cheap && ctx.position(&m.address, 0) == 0.0 && ctx.open_orders(Some(&m.address)).is_empty() {
+                let _ = ctx.market_order(&m.address, 0, Side::Buy, 10, Some(0.3));
+            }
+        }
+    }
+
+    fn on_order(&mut self, _ctx: &mut Ctx, u: &OrderUpdate) {
+        println!("{} {:?}", u.order_id, u.kind);
+    }
+}
+
+// `data` is a Dataset from the loader, as above
+let report = run(&data, &ExecParams::default(), &mut BuyCheapUp)?;
+println!("P&L {:.2}", report.summary.pnl);
+report.write_json(std::path::Path::new("report.json"))?;
+```
+
+**Handlers**: `on_start`, `on_market_open`, `on_book` (book changed), `on_fill` (a recorded fill of other participants), `on_price` (Pyth tick), `on_timer`, `on_market_close` (trading ended, result unknown), `on_resolution` (result on chain, positions paid out), `on_order` (own order accepted, filled partly or fully, cancelled, rejected with a reason, settlement failed), `on_finish`. `subscriptions()` picks what to receive: the book on every change, at most once per N ms (`BookFeed::Throttle(N)`) or not at all; fills; prices; a timer every N ms.
+
+**Context**: `now_ms`, `markets` / `open_markets` / `market` (period, start, end, strike once started, time to end, result once resolved), `book` (both outcomes, full depth), `best_bid` / `best_ask`, `price` / `market_price` (last Pyth price), `usdc` (free) and `usdc_total`, `position`, `open_orders`. Orders: `limit` (GTC), `market_order` (FAK, with an optional worst price), `cancel`. A run can hold many markets; a strategy trades any market that is open.
+
+Two examples in [examples/strategies](examples/strategies): `late_side` buys the outcome on BTC's side of the strike N seconds before the end; `ladder_mm` quotes a ladder on both sides of the mid. `cargo run --example late_side`, `cargo run --example ladder_mm`, or from the command line:
+
+```bash
+lucyd-backtest run --strategy ladder-mm --period 15m --from 2026-10-25T08:00:00Z --to 2026-10-25T14:00:00Z \
+  --queue-model proportional --jitter-ms 50 --report report.json --journal journal.csv
+lucyd-backtest run --strategy late-side --config '{"seconds_before": 60, "usd": 50}' --period 5m --from 2026-10-27 --to 2026-10-28
+```
+
+### Execution parameters
+
+`ExecParams`, from code, from a JSON file (`--params`), or by flags. Every field has a default.
+
+| Field | Flag | Default | |
+|---|---|---|---|
+| `initial_usdc` | `--initial-usdc` | 1000 | USDC at the start |
+| `submit_latency_ms` | `--latency-ms` | 100 | decision to order in the book |
+| `cancel_latency_ms` | `--cancel-latency-ms` | 100 | decision to cancel taking effect; the order can fill meanwhile |
+| `latency_jitter_ms` | `--jitter-ms` | 0 | random extra delay up to this |
+| `queue_model` | `--queue-model` | `pessimistic` | cancellations at our price stood behind us (`pessimistic`) or spread over the level (`proportional`) |
+| `fee_bps` | `--fee-bps` | 0 | trading fee on own fills |
+| `redeem_fee_bps` | | 0 | fee on winning redemptions (the contract's, 0 now) |
+| `revert_probability` | `--revert-probability` | 0 | chance an own fill's settlement fails and is undone |
+| `seed` | `--seed` | 0 | all randomness |
+| `validation_fraction` | `--validation-fraction` | 0.3 | last share of the range reported separately as out-of-sample; 0 = none |
+| `equity_interval_ms` | | 60000 | step of the equity curve |
+| `min_fills_warning` | | 30 | fewer own fills give a warning |
+
+### Report
+
+`Report` (JSON via `to_json` / `write_json`): summary metrics (P&L, return, win rate by market, max drawdown, turnover, fees, average slippage of taker orders, limit order fill rate), the same for the fit and validation samples, per-market results, the equity curve, every own order with its status, the journal of own events, and warnings. `engine::write_journal` writes the journal to CSV or Parquet. Same data, parameters and seed give the same report bit for bit.
+
+### How orders execute, in short
+
+The CLOB keeps one ladder per market: a buy of up at p and a buy of down at 1 − p meet each other (mint), as do two sells (merge); the engine works on that ladder, so liquidity is never counted twice. An order reaches the book after the latency; its crossing part walks the book from the best price (slippage), and what it took stays taken until the recording shows new orders there. A resting order queues behind what was recorded at its price; recorded fills eat that queue and then fill it; the book trading through its price fills it fully. Payout at resolution: 1 USDC for the winner, 0.5 for each token of a voided market.
+
+Limits: other participants do not react to our orders; queue position is an estimate; markets without recorded fills move the queue only on book changes; on testnet most liquidity is the platform's own market maker. Full description: [docs/execution.md](docs/execution.md).
 
 ## Request
 
