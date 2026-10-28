@@ -6,7 +6,11 @@ How to work with this repo and with strategies built on it. Human docs: [README.
 
 A Rust crate and CLI: a loader that downloads historical data of Lucyd prediction markets (L2 order book, order book fills, on-chain trades, Pyth BTC/USD prices) and an engine that backtests a strategy on it. Markets: "will BTC be higher at the end of the period than at the start", periods 5m, 15m, 30m, 1h, 4h, 1d. Outcome 0 is up, 1 is down. Tokens trade from 0.0025 to 0.9975 USDC in steps of 0.0025; the winner pays 1, a voided market pays 0.5 per token. Testnet: liquidity is mostly the platform's own market maker, so results are not real-money estimates.
 
-## Writing a strategy
+## Writing a strategy in Python
+
+`pip install lucyd-backtest`, then `lb.load(...)` for data as pandas DataFrames and a subclass of `lb.Strategy` run with `lb.backtest(data, strategy, **params)`. Same handlers, context and parameters as the Rust API below; outcomes may be `"up"` / `"down"`, sides `"buy"` / `"sell"`. Guide: [python/README.md](python/README.md), example: [python/examples/late_side.py](python/examples/late_side.py). An exception in a handler stops the run and is raised from `backtest`.
+
+## Writing a strategy in Rust
 
 Fastest path, outside this repo:
 
@@ -51,7 +55,7 @@ cargo test
 cargo test -- --ignored   # hits the live testnet and builds a `new` project; needs network
 ```
 
-CI runs the first three on Linux, macOS and Windows. Layout: `src/loader.rs` + `request.rs` (what to load), `book.rs`, `fills.rs`, `trades.rs`, `prices.rs` (sources), `event.rs` (event stream), `engine/` (execution, report, risk, HTML), `scaffold.rs` + `templates/new/` (the `new` command), `main.rs` (CLI). If you change the public API or the report format, update README.md and the docs in the same change.
+CI runs the first three on Linux, macOS and Windows. Python bindings: `python/` (PyO3 crate `lucyd-backtest-py` in `src/lib.rs`, package `lucyd_backtest/`); build locally with `maturin develop --release -m python/Cargo.toml` in a virtualenv, test with `pytest python/tests` (`LUCYD_LIVE=1` for the testnet test). Workflow `.github/workflows/python.yml` builds wheels and publishes to PyPI on a `py-v<version>` tag. Layout: `src/loader.rs` + `request.rs` (what to load), `book.rs`, `fills.rs`, `trades.rs`, `prices.rs` (sources), `event.rs` (event stream), `engine/` (execution, report, risk, HTML), `scaffold.rs` + `templates/new/` (the `new` command), `main.rs` (CLI). If you change the public API or the report format, update README.md and the docs in the same change.
 
 ## Live data in an agent
 

@@ -9,9 +9,12 @@ repository = "https://github.com/lucyd-trade/lucyd-backtest"
 homepage = "https://lucyd.trade"
 documentation = "https://docs.rs/lucyd-backtest"
 readme = "README.md"
-exclude = [".github/"]
+exclude = [".github/", "python/"]
 keywords = ["backtesting", "prediction-markets", "orderbook", "market-data", "pyth"]
 categories = ["finance", "command-line-utilities"]
+
+[workspace]
+members = [".", "python"]
 
 [[bin]]
 name = "lucyd-backtest"

@@ -1,1 +1,8 @@
 /target
+__pycache__/
+*.pyc
+/python/.venv/
+/python/dist/
+*.so
+*.pyd
+*.pdb

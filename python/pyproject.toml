@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "lucyd-backtest"
+version = "0.1.0"
+description = "Backtest trading strategies on Lucyd prediction markets: L2 order book, fills and Pyth prices as pandas DataFrames, an execution engine with latency and queue position, HTML reports"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = ["pandas>=1.5", "pyarrow>=10"]
+keywords = ["backtesting", "prediction-markets", "orderbook", "market-data", "quant", "pyth", "bitcoin"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+[project.urls]
+Homepage = "https://lucyd.trade/data"
+Repository = "https://github.com/lucyd-trade/lucyd-backtest"
+Documentation = "https://github.com/lucyd-trade/lucyd-backtest/tree/main/python"
+
+[tool.maturin]
+module-name = "lucyd_backtest._native"

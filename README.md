@@ -8,7 +8,33 @@ Backtesting toolkit for [Lucyd](https://testnet.lucyd.trade) prediction markets.
 
 Every market asks whether BTC will be higher at the end of its period than at the start. The price at the start is the strike; the market settles on the Pyth BTC/USD price at the end. Two outcome tokens, up and down, trade between 0.0025 and 0.9975 USDC in steps of 0.0025; the winning token pays 1 USDC. A market that gets no oracle price in time is voided and each token pays 0.5. Series: 5 min, 15 min, 30 min, 1 h, 4 h and 1 day, back to back.
 
-## Install
+## Python
+
+```bash
+pip install lucyd-backtest
+```
+
+```python
+import lucyd_backtest as lb
+
+data = lb.load(period="5m", start="2026-10-27", end="2026-10-28")
+data.markets, data.fills(), data.prices()      # pandas DataFrames
+
+class BuyCheapUp(lb.Strategy):
+    timer_ms = 1000
+    def on_timer(self, ctx):
+        for m in ctx.open_markets():
+            ask = ctx.best_ask(m.address, "up")
+            if ask and ask.price <= 0.3 and ctx.position(m.address, "up") == 0:
+                ctx.market_order(m.address, "up", "buy", 10, limit=0.3)
+
+report = lb.backtest(data, BuyCheapUp())
+report                                          # in Jupyter: the full HTML report
+```
+
+The same engine as the Rust crate, compiled into the wheel: no Rust toolchain needed. Full guide: [python/README.md](python/README.md).
+
+## Install (Rust)
 
 With [Rust](https://rustup.rs) 1.88 or newer:
 

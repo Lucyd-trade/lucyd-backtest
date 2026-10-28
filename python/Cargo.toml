@@ -1,0 +1,20 @@
+[package]
+name = "lucyd-backtest-py"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Python bindings of lucyd-backtest"
+license = "MIT"
+repository = "https://github.com/lucyd-trade/lucyd-backtest"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+lucyd-backtest = { path = ".." }
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py39"] }
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
