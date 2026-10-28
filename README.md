@@ -1,6 +1,6 @@
 # lucyd-backtest
 
-Backtesting toolkit for [Lucyd](https://testnet.lucyd.trade) prediction markets. Two parts: a data loader (pick markets by series and time range, download their L2 order book history, order book fills, on-chain trades and Pyth prices, and get them as one time-ordered event stream, with the full order book at any moment) and an execution engine that runs a strategy over that data with latency, slippage and queue position, keeps the account and reports P&L. MCP tools for AI agents will be built on top of it.
+Backtesting toolkit for [Lucyd](https://testnet.lucyd.trade) prediction markets. Two parts: a data loader (pick markets by series and time range, download their L2 order book history, order book fills, on-chain trades and Pyth prices, and get them as one time-ordered event stream, with the full order book at any moment) and an execution engine that runs a strategy over that data with latency, slippage and queue position, keeps the account and reports P&L. Works with AI agents: see [Use with AI agents](#use-with-ai-agents).
 
 > Lucyd currently runs on the Ethereum Sepolia testnet with test USDC. Most of the testnet liquidity comes from the platform's own market maker, plus a small stream of test trades, so books and fills are not those of a live market with independent traders. Use the data to build and test strategies and tooling, not to estimate real-money returns.
 
@@ -255,6 +255,18 @@ The order book and fills files of a market appear after the market ends; a marke
 ## Cache
 
 Downloads are kept in the system cache folder (`lucyd-backtest`). Finished markets and closed days are never downloaded twice; trades of markets still running are topped up on the next run. Files are written through a temporary name and renamed, so an interrupted run never corrupts the cache.
+
+## Use with AI agents
+
+**Writing strategies with a coding agent.** Claude Code, Cursor, Codex and other coding agents read [AGENTS.md](AGENTS.md): how to scaffold a project, the strategy API, which data exists for which dates and how to read the report. Ask it something like "create a strategy that buys the side BTC is on 30 seconds before the end of 5m markets, backtest it on yesterday and show the validation metrics".
+
+**Live markets in an agent.** The [Lucyd MCP server](https://github.com/lucyd-trade/mcp-server) gives Claude, ChatGPT, Cursor and other MCP clients the current markets, order books, trades and trader stats, and can trade from your wallet. Read-only with nothing to install: add `https://mcp.lucyd.trade/mcp` as a custom connector. Locally, with trading from your wallet:
+
+```bash
+claude mcp add lucyd -e LUCYD_PRIVATE_KEY=0xYOUR_KEY -- npx -y @lucyd/mcp
+```
+
+Backtests as MCP tools are planned on top of this crate; they will take the JSON from [Request](#request).
 
 ## Development
 
